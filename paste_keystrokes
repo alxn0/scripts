@@ -1,0 +1,25 @@
+#!/bin/bash
+
+# This script pastes the contents of the clipboard into the currently
+# focused window.
+#
+# It uses xclip to get the clipboard contents and xdotool to simulate
+# keystrokes.
+#
+# Particularly useful for pasting into websites that don't allow
+# pasting via Ctrl+V (annoying for long generated passwords).
+
+# Check if xclip and xdotool are installed
+if ! command -v xclip &> /dev/null
+then
+    echo "xclip could not be found. Please install it."
+    exit 1
+fi
+
+if ! command -v xdotool &> /dev/null
+then
+    echo "xdotool could not be found. Please install it."
+    exit 1
+fi
+
+xclip -selection clipboard -out | tr \\n \\r | xdotool selectwindow windowfocus type --clearmodifiers --delay 25 --window %@ --file -

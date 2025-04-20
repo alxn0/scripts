@@ -1,0 +1,5 @@
+#!/bin/sh
+# This script is used to open files from /scripts in vim.
+# Taken from https://github.com/rwxrob/dot/blob/main/scripts/vic
+cmd=$(command -v "$1") 
+test -n "$cmd" && exec vim "$cmd"

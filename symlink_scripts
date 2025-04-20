@@ -1,0 +1,8 @@
+#!/bin/bash
+# Create a symlink of scripts folder to $HOME
+
+# Get the folder path in which this script is located
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+# Create a symlink to the scripts folder in $HOME
+ln -s "$DIR" "$HOME/Scripts"

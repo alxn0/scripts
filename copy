@@ -1,0 +1,13 @@
+#!/bin/bash
+# Send stdin to system clipboard
+# This script is intended to be used in a pipe
+
+# check if xclip is installed
+if ! command -v xclip &> /dev/null
+then
+    echo "xclip could not be found, please install it first"
+    exit 1
+fi
+
+exec xclip -selection clipboard
+

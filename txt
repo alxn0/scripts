@@ -1,0 +1,3 @@
+#!/bin/sh
+# Convert a Markdown file to plain text.
+exec pandoc -t plain --wrap=none
