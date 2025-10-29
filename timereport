@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""
+Simple time report generator for Taskwarrior timelog data.
+
+Usage: task [filter] export | timereport --depth=1 --by=month
+"""
+
+import sys
+import json
+import argparse
+from datetime import datetime
+from collections import defaultdict
+
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description='Generate time summary report from Taskwarrior export data'
+    )
+    parser.add_argument(
+        '--depth',
+        type=int,
+        default=1,
+        help='Project depth for aggregation (default: 1)'
+    )
+    parser.add_argument(
+        '--by',
+        choices=['month', 'week'],
+        default='month',
+        help='Time period for aggregation (default: month)'
+    )
+    return parser.parse_args()
+
+
+def get_project_at_depth(project, depth):
+    """
+    Extract project name at specified depth.
+
+    Examples:
+        project='foo.bar.baz', depth=1 -> 'foo'
+        project='foo.bar.baz', depth=2 -> 'foo.bar'
+        project='foo.bar.baz', depth=3 -> 'foo.bar.baz'
+    """
+    if not project:
+        return '(no project)'
+
+    parts = project.split('.')
+    if depth >= len(parts):
+        return project
+    return '.'.join(parts[:depth])
+
+
+def get_period_key(timestamp, period_type):
+    """
+    Convert Unix timestamp to period key.
+
+    Args:
+        timestamp: Unix epoch timestamp (seconds)
+        period_type: 'month' or 'week'
+
+    Returns:
+        Period key string (e.g., '2024-10' for month, '2024-W43' for week)
+    """
+    dt = datetime.fromtimestamp(timestamp)
+
+    if period_type == 'month':
+        return dt.strftime('%Y-%m')
+    elif period_type == 'week':
+        # ISO week format: YYYY-W##
+        year, week, _ = dt.isocalendar()
+        return f'{year}-W{week:02d}'
+    else:
+        raise ValueError(f'Unknown period type: {period_type}')
+
+
+def parse_timelog(task):
+    """
+    Parse timelog UDA from task.
+
+    Returns:
+        List of time segments [{'start': epoch, 'end': epoch}, ...]
+    """
+    timelog_str = task.get('timelog', '[]')
+
+    if not timelog_str:
+        return []
+
+    try:
+        timelog = json.loads(timelog_str)
+        return timelog if isinstance(timelog, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def aggregate_time_data(tasks, depth, period_type):
+    """
+    Aggregate time data by project and period.
+
+    Returns:
+        dict: {project: {period: seconds}}
+    """
+    data = defaultdict(lambda: defaultdict(int))
+
+    for task in tasks:
+        # Get project at specified depth
+        project_raw = task.get('project', '')
+        project = get_project_at_depth(project_raw, depth)
+
+        # Parse timelog
+        segments = parse_timelog(task)
+
+        # Aggregate each segment
+        for segment in segments:
+            start = segment.get('start')
+            end = segment.get('end')
+
+            if start is None or end is None:
+                continue
+
+            # Calculate duration
+            duration = end - start
+            if duration < 0:
+                continue
+
+            # Get period key
+            period = get_period_key(start, period_type)
+
+            # Accumulate time
+            data[project][period] += duration
+
+    return data
+
+
+def format_hours(seconds):
+    """Convert seconds to hours with 1 decimal place."""
+    hours = seconds / 3600.0
+    return f'{hours:.1f}'
+
+
+def generate_table(data, period_type):
+    """
+    Generate formatted table from aggregated data.
+
+    Args:
+        data: {project: {period: seconds}}
+        period_type: 'month' or 'week'
+    """
+    if not data:
+        print('No time data found.')
+        return
+
+    # Get all unique periods and sort them
+    all_periods = set()
+    for periods in data.values():
+        all_periods.update(periods.keys())
+    periods = sorted(all_periods)
+
+    # Get all projects and sort them
+    projects = sorted(data.keys())
+
+    # Calculate column widths
+    project_width = max(len(p) for p in projects) if projects else 10
+    project_width = max(project_width, len('Project'))
+
+    period_width = 10  # Width for period columns
+    total_width = 10   # Width for total column
+
+    # Print header
+    header = f'{"Project":<{project_width}}'
+    for period in periods:
+        header += f'  {period:>{period_width}}'
+    header += f'  {"Total":>{total_width}}'
+    print(header)
+
+    # Print separator
+    sep_length = len(header)
+    print('-' * sep_length)
+
+    # Print data rows
+    period_totals = defaultdict(int)
+    grand_total = 0
+
+    for project in projects:
+        row = f'{project:<{project_width}}'
+        project_total = 0
+
+        for period in periods:
+            seconds = data[project].get(period, 0)
+            hours_str = format_hours(seconds)
+            row += f'  {hours_str:>{period_width}}'
+            period_totals[period] += seconds
+            project_total += seconds
+
+        total_str = format_hours(project_total)
+        row += f'  {total_str:>{total_width}}'
+        grand_total += project_total
+
+        print(row)
+
+    # Print separator
+    print('-' * sep_length)
+
+    # Print totals row
+    totals_row = f'{"TOTAL":<{project_width}}'
+    for period in periods:
+        hours_str = format_hours(period_totals[period])
+        totals_row += f'  {hours_str:>{period_width}}'
+    grand_total_str = format_hours(grand_total)
+    totals_row += f'  {grand_total_str:>{total_width}}'
+    print(totals_row)
+
+
+def main():
+    """Main entry point."""
+    args = parse_args()
+
+    # Read JSON from stdin
+    try:
+        tasks = json.load(sys.stdin)
+    except json.JSONDecodeError as e:
+        print(f'Error parsing JSON input: {e}', file=sys.stderr)
+        return 1
+
+    if not isinstance(tasks, list):
+        print('Error: Expected JSON array of tasks', file=sys.stderr)
+        return 1
+
+    # Aggregate data
+    data = aggregate_time_data(tasks, args.depth, args.by)
+
+    # Generate table
+    generate_table(data, args.by)
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

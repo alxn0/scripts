@@ -1,0 +1,12 @@
+#!/bin/bash
+
+# Display active Taskwarrior tasks with elapsed time on a single line
+# Format: [project] task: HH:MM | [project] task: HH:MM
+
+task +ACTIVE export | jq -r '.[] | .project + "|" + .description + "|" + .start' | while read line; do
+    start=$(echo "$line" | sed 's/.*|//; s/\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)T\([0-9]\{2\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)Z/\1-\2-\3T\4:\5:\6Z/')
+    elapsed=$(($(date +%s) - $(date -d "$start" +%s)))
+    proj=$(echo "$line" | cut -d'|' -f1)
+    task=$(echo "$line" | cut -d'|' -f2)
+    printf "[%s] %s: %02dh%02dm| " "$proj" "$task" $((elapsed/3600)) $((elapsed%3600/60))
+done | sed 's/ | $//' | sed 's/^/⏱ /'

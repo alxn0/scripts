@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""
+Interactive timelog editor for Taskwarrior.
+
+Exports a single task by ID, flattens timelog into editable JSON array,
+opens in $EDITOR, validates changes, and imports back to update the task.
+
+Usage: editlog TASK_ID
+
+Example:
+    editlog 42
+"""
+
+import sys
+import json
+import os
+import tempfile
+import subprocess
+import argparse
+from datetime import datetime
+
+
+def epoch_to_human(timestamp):
+    """
+    Convert UNIX epoch timestamp to human-readable local time.
+
+    Args:
+        timestamp: Unix epoch seconds (int)
+
+    Returns:
+        String in format: YYYY-MM-DD HH:MM:SS TZ (or YYYY-MM-DD HH:MM:SS if no TZ)
+    """
+    dt = datetime.fromtimestamp(timestamp)
+    time_part = dt.strftime('%Y-%m-%d %H:%M:%S')
+    tz_part = dt.strftime('%Z')
+
+    # Only add timezone if it's non-empty
+    if tz_part:
+        return f'{time_part} {tz_part}'
+    return time_part
+
+
+def human_to_epoch(time_str):
+    """
+    Convert human-readable time to UNIX epoch timestamp.
+
+    Accepts formats:
+        YYYY-MM-DD HH:MM:SS
+        YYYY-MM-DD HH:MM:SS TZ (timezone ignored, uses local)
+
+    Args:
+        time_str: Human-readable time string
+
+    Returns:
+        Unix epoch seconds (int)
+
+    Raises:
+        ValueError: If time format is invalid
+    """
+    # Strip whitespace and split
+    parts = time_str.strip().split()
+
+    # Remove empty parts (handles trailing spaces)
+    parts = [p for p in parts if p]
+
+    if len(parts) == 2:
+        # YYYY-MM-DD HH:MM:SS (date and time only)
+        time_str = ' '.join(parts)
+    elif len(parts) == 3:
+        # YYYY-MM-DD HH:MM:SS TZ (has timezone, ignore it)
+        time_str = ' '.join(parts[:2])
+    else:
+        raise ValueError(f'Invalid time format: {time_str}')
+
+    # Parse datetime
+    try:
+        dt = datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
+    except ValueError as e:
+        raise ValueError(f'Invalid time format "{time_str}": {e}')
+
+    # Convert to epoch (assumes local timezone)
+    return int(dt.timestamp())
+
+
+def export_task(task_id):
+    """
+    Export a single task by ID using 'task ID export'.
+
+    Args:
+        task_id: Task ID number
+
+    Returns:
+        Task dict from JSON export
+
+    Raises:
+        RuntimeError: If task export fails
+    """
+    try:
+        result = subprocess.run(
+            ['task', str(task_id), 'export'],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        tasks = json.loads(result.stdout)
+
+        if not tasks or not isinstance(tasks, list):
+            raise RuntimeError(f'Task {task_id} not found')
+
+        return tasks[0]
+
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f'Failed to export task {task_id}: {e.stderr}')
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f'Invalid JSON from task export: {e}')
+
+
+def parse_timelog(task):
+    """
+    Parse timelog UDA from task.
+
+    Returns:
+        List of time segments [{'start': epoch, 'end': epoch}, ...]
+    """
+    timelog_str = task.get('timelog', '[]')
+
+    if not timelog_str:
+        return []
+
+    try:
+        timelog = json.loads(timelog_str)
+        return timelog if isinstance(timelog, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def flatten_to_segments(task):
+    """
+    Flatten task timelog into editable segment list.
+
+    Args:
+        task: Task dict from task export
+
+    Returns:
+        List of segment dicts with human-readable times
+    """
+    task_id = task.get('id', 0)
+    project = task.get('project', '')
+    description = task.get('description', '')
+
+    timelog = parse_timelog(task)
+    segments = []
+
+    for segment in timelog:
+        start_epoch = segment.get('start')
+        end_epoch = segment.get('end')
+
+        if start_epoch is None or end_epoch is None:
+            continue
+
+        # Convert to human-readable
+        start_human = epoch_to_human(start_epoch)
+        end_human = epoch_to_human(end_epoch)
+
+        segment_obj = {
+            'id': task_id,
+            'project': project,
+            'description': description,
+            'start': start_human,
+            'end': end_human
+        }
+
+        segments.append(segment_obj)
+
+    return segments
+
+
+def validate_segments(segments_data):
+    """
+    Validate edited segments data.
+
+    Args:
+        segments_data: String content from editor
+
+    Returns:
+        List of validated segment dicts
+
+    Raises:
+        ValueError: If validation fails
+    """
+    # Parse JSON
+    try:
+        data = json.loads(segments_data)
+    except json.JSONDecodeError as e:
+        raise ValueError(f'Invalid JSON: {e}')
+
+    # Must be array
+    if not isinstance(data, list):
+        raise ValueError('Expected JSON array of segments')
+
+    # Validate each segment
+    for i, seg in enumerate(data):
+        # Check required fields
+        if 'start' not in seg:
+            raise ValueError(f'Segment {i}: missing "start" field')
+        if 'end' not in seg:
+            raise ValueError(f'Segment {i}: missing "end" field')
+
+        # Parse times
+        try:
+            start_epoch = human_to_epoch(seg['start'])
+            end_epoch = human_to_epoch(seg['end'])
+        except ValueError as e:
+            raise ValueError(f'Segment {i}: {e}')
+
+        # Check duration
+        if end_epoch < start_epoch:
+            raise ValueError(
+                f'Segment {i}: end time before start time\n'
+                f'  Start: {seg["start"]}\n'
+                f'  End: {seg["end"]}'
+            )
+
+    # Check for overlaps (warning only)
+    check_overlaps(data)
+
+    return data
+
+
+def check_overlaps(segments):
+    """
+    Check for overlapping time segments and print warnings.
+
+    Args:
+        segments: List of segment dicts
+    """
+    if len(segments) < 2:
+        return
+
+    # Convert to epoch for comparison
+    epochs = []
+    for i, seg in enumerate(segments):
+        try:
+            start = human_to_epoch(seg['start'])
+            end = human_to_epoch(seg['end'])
+            epochs.append((i, start, end))
+        except ValueError:
+            continue
+
+    # Sort by start time
+    epochs.sort(key=lambda x: x[1])
+
+    # Check for overlaps
+    for i in range(len(epochs) - 1):
+        curr_idx, curr_start, curr_end = epochs[i]
+        next_idx, next_start, next_end = epochs[i + 1]
+
+        if curr_end > next_start:
+            print(
+                f'Warning: Segments {curr_idx} and {next_idx} overlap',
+                file=sys.stderr
+            )
+
+
+def reconstruct_task(segments, original_task):
+    """
+    Reconstruct task with modified timelog.
+
+    Args:
+        segments: List of validated segment dicts
+        original_task: Original task dict (preserves other fields)
+
+    Returns:
+        Modified task dict ready for import
+    """
+    # Start with original task (preserves UUID and other fields)
+    task = original_task.copy()
+
+    # Rebuild timelog array
+    timelog = []
+    total_seconds = 0
+
+    for seg in segments:
+        start_epoch = human_to_epoch(seg['start'])
+        end_epoch = human_to_epoch(seg['end'])
+
+        duration = end_epoch - start_epoch
+        total_seconds += duration
+
+        timelog.append({
+            'start': start_epoch,
+            'end': end_epoch
+        })
+
+    # Update task
+    task['timelog'] = json.dumps(timelog)
+    task['totalactivetime'] = total_seconds
+
+    # Update project/description if changed in first segment
+    if segments:
+        first_seg = segments[0]
+        if 'project' in first_seg:
+            task['project'] = first_seg['project']
+        if 'description' in first_seg:
+            task['description'] = first_seg['description']
+
+    return task
+
+
+def import_task(task):
+    """
+    Import task using 'task import -'.
+
+    Args:
+        task: Task dict to import
+
+    Raises:
+        RuntimeError: If import fails
+    """
+    task_json = json.dumps([task])
+
+    try:
+        result = subprocess.run(
+            ['task', 'import', '-'],
+            input=task_json,
+            text=True,
+            capture_output=True,
+            check=True
+        )
+
+        # Show import output
+        if result.stdout:
+            print(result.stdout, file=sys.stderr)
+
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f'Failed to import task: {e.stderr}')
+
+
+def open_in_editor(content):
+    """
+    Open content in user's editor and return edited content.
+
+    Args:
+        content: String content to edit
+
+    Returns:
+        Edited content as string
+
+    Raises:
+        RuntimeError: If editor fails
+    """
+    # Get editor from environment
+    editor = os.environ.get('EDITOR', 'vi')
+
+    # Create temporary file
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        temp_path = f.name
+        f.write(content)
+
+    try:
+        # Open editor
+        result = subprocess.run([editor, temp_path])
+
+        if result.returncode != 0:
+            raise RuntimeError(f'Editor exited with code {result.returncode}')
+
+        # Read edited content
+        with open(temp_path, 'r') as f:
+            edited_content = f.read()
+
+        return edited_content
+
+    finally:
+        # Clean up temp file
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+
+def main():
+    """Main entry point."""
+    # Parse arguments
+    parser = argparse.ArgumentParser(
+        description='Interactive timelog editor for Taskwarrior'
+    )
+    parser.add_argument(
+        'task_id',
+        type=int,
+        help='Task ID to edit'
+    )
+    args = parser.parse_args()
+
+    try:
+        # Phase 1: Export task
+        print(f'Exporting task {args.task_id}...', file=sys.stderr)
+        task = export_task(args.task_id)
+
+        # Phase 2: Flatten to segments
+        segments = flatten_to_segments(task)
+
+        if not segments:
+            print(f'Task {args.task_id} has no time segments', file=sys.stderr)
+            return 1
+
+        # Convert to pretty-printed JSON
+        json_content = json.dumps(segments, indent=2)
+
+        # Phase 3: Open in editor
+        print(f'Opening in $EDITOR...', file=sys.stderr)
+        edited_content = open_in_editor(json_content)
+
+        # Phase 4: Validate
+        print('Validating changes...', file=sys.stderr)
+        validated_segments = validate_segments(edited_content)
+
+        # Phase 5: Reconstruct task
+        modified_task = reconstruct_task(validated_segments, task)
+
+        # Phase 6: Import
+        print(f'Importing task {args.task_id}...', file=sys.stderr)
+        import_task(modified_task)
+
+        print(f'Successfully updated task {args.task_id}', file=sys.stderr)
+        return 0
+
+    except RuntimeError as e:
+        print(f'Error: {e}', file=sys.stderr)
+        return 1
+    except ValueError as e:
+        print(f'Validation error: {e}', file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print('\nAborted by user', file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f'Unexpected error: {e}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
