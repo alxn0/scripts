@@ -3,12 +3,17 @@
 Simple time report generator for Taskwarrior timelog data.
 
 Usage: task [filter] export | timereport --depth=1 --by=month
+       task [filter] export | timereport --by=day --begin 2025-01-01 --end 2025-01-08
+       task [filter] export | timereport --by=day --rows=d --begin 2025-01-01 -e 2025-01-08
+       task [filter] export | timereport --period week --by=day
+       task [filter] export | timereport --period lastmonth --rows=p
 """
 
 import sys
 import json
 import argparse
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from collections import defaultdict
 
 
@@ -25,9 +30,33 @@ def parse_args():
     )
     parser.add_argument(
         '--by',
-        choices=['month', 'week'],
+        choices=['month', 'week', 'day'],
         default='month',
         help='Time period for aggregation (default: month)'
+    )
+    parser.add_argument(
+        '--begin', '-b',
+        type=str,
+        default=None,
+        help='Start date for filtering (YYYY-MM-DD format)'
+    )
+    parser.add_argument(
+        '--end', '-e',
+        type=str,
+        default=None,
+        help='End date for filtering (YYYY-MM-DD format)'
+    )
+    parser.add_argument(
+        '--rows', '-r',
+        choices=['d', 'p', 'l'],
+        default='d',
+        help='Output format: d=days as rows, p=projects as rows, l=list format (default: d)'
+    )
+    parser.add_argument(
+        '--period', '-p',
+        type=str,
+        default=None,
+        help='Period expression: week, lastweek, month, lastmonth, year, lastyear, or relative (e.g., 2weeks, 3days, 2week, 4month)'
     )
     return parser.parse_args()
 
@@ -56,10 +85,10 @@ def get_period_key(timestamp, period_type):
 
     Args:
         timestamp: Unix epoch timestamp (seconds)
-        period_type: 'month' or 'week'
+        period_type: 'month', 'week', or 'day'
 
     Returns:
-        Period key string (e.g., '2024-10' for month, '2024-W43' for week)
+        Period key string (e.g., '2024-10' for month, '2024-W43' for week, '2024-10-15' for day)
     """
     dt = datetime.fromtimestamp(timestamp)
 
@@ -69,8 +98,168 @@ def get_period_key(timestamp, period_type):
         # ISO week format: YYYY-W##
         year, week, _ = dt.isocalendar()
         return f'{year}-W{week:02d}'
+    elif period_type == 'day':
+        return dt.strftime('%Y-%m-%d')
     else:
         raise ValueError(f'Unknown period type: {period_type}')
+
+
+def parse_date(date_str):
+    """
+    Parse date string to Unix timestamp.
+
+    Args:
+        date_str: Date string in YYYY-MM-DD format
+
+    Returns:
+        Unix timestamp (seconds) at start of day, or None if invalid
+    """
+    if not date_str:
+        return None
+
+    try:
+        dt = datetime.strptime(date_str, '%Y-%m-%d')
+        return int(dt.timestamp())
+    except ValueError:
+        return None
+
+
+def parse_period(period_str):
+    """
+    Parse period expression to begin/end timestamps.
+
+    Args:
+        period_str: Period expression (week, lastweek, month, lastmonth, year, lastyear,
+                    or relative like 2weeks, 3days, 2week, 4month)
+
+    Returns:
+        Tuple of (begin_timestamp, end_timestamp) or (None, None) if invalid
+    """
+    if not period_str:
+        return None, None
+
+    now = datetime.now()
+
+    # Helper to get start/end of week
+    def get_week_bounds(dt):
+        # ISO week: Monday=0, Sunday=6
+        start = dt - timedelta(days=dt.weekday())
+        start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=6)
+        end = end.replace(hour=23, minute=59, second=59, microsecond=0)
+        return start, end
+
+    # Helper to get start/end of month
+    def get_month_bounds(dt):
+        start = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        # Last day of month
+        if dt.month == 12:
+            next_month = dt.replace(year=dt.year + 1, month=1, day=1)
+        else:
+            next_month = dt.replace(month=dt.month + 1, day=1)
+        end = (next_month - timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=0)
+        return start, end
+
+    # Helper to get start/end of year
+    def get_year_bounds(dt):
+        start = dt.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = dt.replace(month=12, day=31, hour=23, minute=59, second=59, microsecond=0)
+        return start, end
+
+    # Helper to get start/end of day
+    def get_day_bounds(dt):
+        start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = dt.replace(hour=23, minute=59, second=59, microsecond=0)
+        return start, end
+
+    period_str = period_str.lower()
+
+    # Check for relative lookback expressions
+    # Pattern: optional number + unit (singular or plural)
+    # Singular: day, week, month, year
+    # Plural: days, weeks, months, years
+    pattern = r'^(\d+)?(day|week|month|year)s?$'
+    match = re.match(pattern, period_str)
+
+    if match:
+        count_str, unit = match.groups()
+        count = int(count_str) if count_str else 1
+        is_plural = period_str.endswith('s')
+
+        if is_plural:
+            # Plural form: inclusive range (last N periods including current)
+            # E.g., 2weeks = this week + last week
+            if unit == 'day':
+                end = now.replace(hour=23, minute=59, second=59, microsecond=0)
+                start = (now - timedelta(days=count - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            elif unit == 'week':
+                # End of current week
+                _, end = get_week_bounds(now)
+                # Start of N weeks ago (including current)
+                start_week = now - timedelta(weeks=count - 1)
+                start, _ = get_week_bounds(start_week)
+            elif unit == 'month':
+                # End of current month
+                _, end = get_month_bounds(now)
+                # Start of N months ago (including current)
+                # Navigate back N-1 months
+                target_dt = now
+                for _ in range(count - 1):
+                    first_of_month = target_dt.replace(day=1)
+                    target_dt = first_of_month - timedelta(days=1)
+                start, _ = get_month_bounds(target_dt)
+            elif unit == 'year':
+                # End of current year
+                _, end = get_year_bounds(now)
+                # Start of N years ago (including current)
+                start_year = now.replace(year=now.year - (count - 1))
+                start, _ = get_year_bounds(start_year)
+        else:
+            # Singular form: specific past period
+            # E.g., week or 1week = this week, 2week = last week, 3week = 2 weeks ago
+            periods_ago = count - 1
+
+            if unit == 'day':
+                target_dt = now - timedelta(days=periods_ago)
+                start, end = get_day_bounds(target_dt)
+            elif unit == 'week':
+                target_dt = now - timedelta(weeks=periods_ago)
+                start, end = get_week_bounds(target_dt)
+            elif unit == 'month':
+                # Navigate back periods_ago months
+                target_dt = now
+                for _ in range(periods_ago):
+                    first_of_month = target_dt.replace(day=1)
+                    target_dt = first_of_month - timedelta(days=1)
+                start, end = get_month_bounds(target_dt)
+            elif unit == 'year':
+                target_dt = now.replace(year=now.year - periods_ago)
+                start, end = get_year_bounds(target_dt)
+
+        return int(start.timestamp()), int(end.timestamp())
+
+    # Legacy named period expressions
+    if period_str == 'week':
+        start, end = get_week_bounds(now)
+    elif period_str == 'lastweek':
+        last_week = now - timedelta(weeks=1)
+        start, end = get_week_bounds(last_week)
+    elif period_str == 'month':
+        start, end = get_month_bounds(now)
+    elif period_str == 'lastmonth':
+        # Go to first day of current month, then back one day to get last month
+        first_of_month = now.replace(day=1)
+        last_month = first_of_month - timedelta(days=1)
+        start, end = get_month_bounds(last_month)
+    elif period_str == 'year':
+        start, end = get_year_bounds(now)
+    elif period_str == 'lastyear':
+        last_year = now.replace(year=now.year - 1)
+        start, end = get_year_bounds(last_year)
+    else:
+        return None, None
+
+    return int(start.timestamp()), int(end.timestamp())
 
 
 def parse_timelog(task):
@@ -92,9 +281,16 @@ def parse_timelog(task):
         return []
 
 
-def aggregate_time_data(tasks, depth, period_type):
+def aggregate_time_data(tasks, depth, period_type, begin_date=None, end_date=None):
     """
     Aggregate time data by project and period.
+
+    Args:
+        tasks: List of tasks from Taskwarrior export
+        depth: Project depth for aggregation
+        period_type: 'month', 'week', or 'day'
+        begin_date: Start timestamp for filtering (Unix epoch seconds), or None
+        end_date: End timestamp for filtering (Unix epoch seconds), or None
 
     Returns:
         dict: {project: {period: seconds}}
@@ -117,6 +313,12 @@ def aggregate_time_data(tasks, depth, period_type):
             if start is None or end is None:
                 continue
 
+            # Filter by date range if specified
+            if begin_date is not None and start < begin_date:
+                continue
+            if end_date is not None and start >= end_date:
+                continue
+
             # Calculate duration
             duration = end - start
             if duration < 0:
@@ -137,7 +339,7 @@ def format_hours(seconds):
     return f'{hours:.1f}'
 
 
-def generate_table(data, period_type):
+def generate_table_by_projects(data, period_type):
     """
     Generate formatted table from aggregated data.
 
@@ -210,6 +412,124 @@ def generate_table(data, period_type):
     print(totals_row)
 
 
+def generate_table_by_days(data, period_type):
+    """
+    Generate formatted table with days as rows and projects as columns.
+
+    Args:
+        data: {project: {period: seconds}}
+        period_type: 'month', 'week', or 'day'
+    """
+    if not data:
+        print('No time data found.')
+        return
+
+    # Get all unique periods and sort them
+    all_periods = set()
+    for periods in data.values():
+        all_periods.update(periods.keys())
+    periods = sorted(all_periods)
+
+    # Get all projects and sort them
+    projects = sorted(data.keys())
+
+    # Calculate column widths
+    date_width = max(len(p) for p in periods) if periods else 10
+    date_width = max(date_width, len('Date'))
+
+    project_width = 10  # Width for project columns
+    total_width = 10    # Width for total column
+
+    # Print header
+    header = f'{"Date":<{date_width}}'
+    for project in projects:
+        # Truncate project name if too long
+        display_name = project[:project_width]
+        header += f'  {display_name:>{project_width}}'
+    header += f'  {"Total":>{total_width}}'
+    print(header)
+
+    # Print separator
+    sep_length = len(header)
+    print('-' * sep_length)
+
+    # Print data rows
+    project_totals = defaultdict(int)
+    grand_total = 0
+
+    for period in periods:
+        row = f'{period:<{date_width}}'
+        period_total = 0
+
+        for project in projects:
+            seconds = data[project].get(period, 0)
+            hours_str = format_hours(seconds)
+            row += f'  {hours_str:>{project_width}}'
+            project_totals[project] += seconds
+            period_total += seconds
+
+        total_str = format_hours(period_total)
+        row += f'  {total_str:>{total_width}}'
+        grand_total += period_total
+
+        print(row)
+
+    # Print separator
+    print('-' * sep_length)
+
+    # Print totals row
+    totals_row = f'{"TOTAL":<{date_width}}'
+    for project in projects:
+        hours_str = format_hours(project_totals[project])
+        totals_row += f'  {hours_str:>{project_width}}'
+    grand_total_str = format_hours(grand_total)
+    totals_row += f'  {grand_total_str:>{total_width}}'
+    print(totals_row)
+
+
+def generate_table_list(data, period_type):
+    """
+    Generate list format output (one row per date-project combination).
+
+    Args:
+        data: {project: {period: seconds}}
+        period_type: 'month', 'week', or 'day'
+    """
+    if not data:
+        print('No time data found.')
+        return
+
+    # Collect all (period, project, hours) tuples
+    rows = []
+    for project, periods in data.items():
+        for period, seconds in periods.items():
+            rows.append((period, project, seconds))
+
+    # Sort by period, then project
+    rows.sort(key=lambda x: (x[0], x[1]))
+
+    # Calculate column widths
+    date_width = max(len(row[0]) for row in rows) if rows else 10
+    date_width = max(date_width, len('Date'))
+
+    project_width = max(len(row[1]) for row in rows) if rows else 15
+    project_width = max(project_width, len('Project'))
+
+    hours_width = 10
+
+    # Print header
+    header = f'{"Date":<{date_width}}  {"Project":<{project_width}}  {"Hours":>{hours_width}}'
+    print(header)
+
+    # Print separator
+    print('-' * len(header))
+
+    # Print data rows
+    for period, project, seconds in rows:
+        hours_str = format_hours(seconds)
+        print(f'{period:<{date_width}}  {project:<{project_width}}  {hours_str:>{hours_width}}')
+
+
 def main():
     """Main entry point."""
     args = parse_args()
@@ -225,11 +545,39 @@ def main():
         print('Error: Expected JSON array of tasks', file=sys.stderr)
         return 1
 
-    # Aggregate data
-    data = aggregate_time_data(tasks, args.depth, args.by)
+    # Validate mutually exclusive flags
+    if args.period and (args.begin or args.end):
+        print('Error: --period cannot be used with --begin or --end', file=sys.stderr)
+        return 1
 
-    # Generate table
-    generate_table(data, args.by)
+    # Parse date range
+    if args.period:
+        begin_timestamp, end_timestamp = parse_period(args.period)
+        if begin_timestamp is None:
+            print(f'Error: Invalid period: {args.period}. Use: week, lastweek, month, lastmonth, year, lastyear, or relative (e.g., 2weeks, 3days, 2week, 4month)', file=sys.stderr)
+            return 1
+    else:
+        begin_timestamp = parse_date(args.begin)
+        end_timestamp = parse_date(args.end)
+
+        # Validate dates
+        if args.begin and begin_timestamp is None:
+            print(f'Error: Invalid begin date format: {args.begin}. Use YYYY-MM-DD', file=sys.stderr)
+            return 1
+        if args.end and end_timestamp is None:
+            print(f'Error: Invalid end date format: {args.end}. Use YYYY-MM-DD', file=sys.stderr)
+            return 1
+
+    # Aggregate data
+    data = aggregate_time_data(tasks, args.depth, args.by, begin_timestamp, end_timestamp)
+
+    # Generate table based on output format
+    if args.rows == 'd':
+        generate_table_by_days(data, args.by)
+    elif args.rows == 'p':
+        generate_table_by_projects(data, args.by)
+    elif args.rows == 'l':
+        generate_table_list(data, args.by)
 
     return 0
 
