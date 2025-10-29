@@ -1,0 +1,140 @@
+#!/bin/bash
+#
+# Journal Account Updater
+# =======================
+# Reads hledger rules file and updates journal transactions in-place.
+# 
+# Usage: ./update-journal-inplace.sh <journal_file> <rules_file>
+#
+# Process:
+# 1. Parse rules file to extract pattern->account mappings
+# 2. For each pattern, find matching transactions in journal
+# 3. Replace "expenses:unknown" with correct account within those transactions
+#
+# Example: If rules say "EDF -> expenses:home:electricity", 
+# then transactions containing "EDF" get their unknown accounts updated.
+#
+
+update_journal() {
+    local JOURNAL_FILE="$1"
+    local RULES_FILE="$2"
+    local DEBUG="${3:-false}"  # Optional third argument for debug mode
+    
+    # Validate arguments
+    if [ -z "$JOURNAL_FILE" ] || [ -z "$RULES_FILE" ]; then
+        echo "Usage: $0 <journal_file> <rules_file> [debug]"
+        echo "Example: $0 transactions.journal account2.rules"
+        echo "Debug: $0 transactions.journal account2.rules debug"
+        exit 1
+    fi
+    
+    # Check if files exist
+    if [ ! -f "$JOURNAL_FILE" ]; then
+        echo "Error: Journal file '$JOURNAL_FILE' not found"
+        exit 1
+    fi
+    
+    if [ ! -f "$RULES_FILE" ]; then
+        echo "Error: Rules file '$RULES_FILE' not found"
+        exit 1
+    fi
+
+    # Backup original journal
+    cp "$JOURNAL_FILE" "$JOURNAL_FILE.bak"
+
+    echo "Updating journal in-place with rules from $RULES_FILE..."
+    
+    if [ "$DEBUG" = "debug" ]; then
+        echo "=== DEBUG MODE ENABLED ==="
+        echo "Journal file: $JOURNAL_FILE"
+        echo "Rules file: $RULES_FILE"
+        echo "=== AWK OUTPUT ==="
+    fi
+
+    # AWK processes text files line by line (like a for loop over lines)
+    # Think of it as: for each line in file, run these conditions
+    awk '
+    BEGIN { 
+        in_rule = 0       # Boolean: are we currently parsing a rule?
+        delete patterns       # Initialize empty array (unnecessary in AWK, but improves readability)
+    }
+
+    # Beginning of a rule: line contains only "if" 
+    /^if$/ { 
+        in_rule = 1        # Start collecting patterns for this rule
+        delete patterns       # Clear array (like patterns.clear() in Python)
+        pattern_count = 0     # Reset counter - only needed when starting new rule
+        next                  # Continue to next line (like "continue" in a loop)
+    }
+
+    # Pattern lines: start with a letter
+    in_rule && /^[A-Za-z]/ { 
+        pattern_count++
+        patterns[pattern_count] = $0    # $0 = entire current line (like line.strip())
+        next
+    }
+
+    # Account2 assignement: whitespace + "account2"
+    in_rule && /^[[:space:]]+account2/ { 
+        account = $2          # $2 = second word on line (split by whitespace)
+        
+        # Loop through collected patterns and output them
+        for (i = 1; i <= pattern_count; i++) {
+            print patterns[i] "|" account    # print sends to stdout → piped to while loop below
+        }
+        
+        # Reset for next rule
+        in_rule = 0
+        next
+    }
+
+    ' "$RULES_FILE" | while IFS='|' read -r pattern account; do
+        # Bash equivalent of: pattern, account = line.split("|")
+        
+        if [ "$DEBUG" = "debug" ]; then
+            echo "=== PROCESSING ==="
+            echo "Pattern: '$pattern'"
+            echo "Account: '$account'"
+            echo "Searching for pattern in journal..."
+            grep -n "$pattern" "$JOURNAL_FILE" || echo "No matches found for pattern: $pattern"
+            echo "Current expenses:unknown entries:"
+            grep -n "expenses:unknown" "$JOURNAL_FILE" || echo "No expenses:unknown found"
+        fi
+        
+        # Safety check: only verify both variables are non-empty (doesn't validate pattern matching)
+        if [ -n "$pattern" ] && [ -n "$account" ]; then
+            echo "  Applying: $pattern -> $account"
+            
+            if [ "$DEBUG" = "debug" ]; then
+                echo "  Running sed command..."
+                echo "  Before sed:"
+                grep -A2 -B2 "$pattern" "$JOURNAL_FILE" || echo "  Pattern not found in journal"
+            fi
+            
+            # sed = find/replace tool
+            # "/$pattern/,/^[[:space:]]*$/" = from line containing pattern to next blank line
+            # "s/old/new/g" = replace "old" with "new" globally
+            #sed -i "/$pattern/,/^[[:space:]]*$/s/expenses:unknown/$account/g" "$JOURNAL_FILE"
+          
+            # sed = find/replace tool
+            # "/$pattern/,/^[[:space:]]*$/" = from line containing pattern to next blank line
+            # Replace entire account field with new account (handles both € and $ currencies)
+            sed -i "/$pattern/,/^[[:space:]]*$/{
+                /^[[:space:]]*[^[:space:]]*[[:space:]]*[€$]/{
+                    s/^[[:space:]]*[^[:space:]]*[[:space:]]*\([€$].*\)/    $account          \1/
+                }
+            }" "$JOURNAL_FILE"
+
+            if [ "$DEBUG" = "debug" ]; then
+                echo "  After sed:"
+                grep -A2 -B2 "$pattern" "$JOURNAL_FILE" || echo "  Pattern not found in journal"
+                echo "  ---"
+            fi
+        fi
+    done
+
+    echo "Journal updated successfully. Backup saved as $JOURNAL_FILE.bak"
+}
+
+# Call function with command line arguments
+update_journal "$1" "$2" "$3"
