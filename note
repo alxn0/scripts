@@ -1,0 +1,25 @@
+#!/bin/bash
+
+case "$1" in
+    journal)
+        vim -c "WikiJournal"
+        ;;
+    index)
+        vim -c "WikiIndex"
+        ;;
+    page)
+        vim -c "WikiOpen"
+        ;;
+    search)
+        vim -c "WikiPages"
+        ;;
+    rg)
+        rg "$2" "$NOTES"
+        ;;
+    *)
+        echo "Usage: note <command> <args>"
+        echo "Commands: journal index page search rg"
+        exit 1
+        ;;
+esac
+
