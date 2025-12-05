@@ -1,24 +1,62 @@
 #!/bin/bash
 
+show_help() {
+    cat << 'EOF'
+note - Quick access to notes directory ($NOTES)
+
+USAGE
+    note <command> [args]
+
+COMMANDS
+    journal         Open today's journal ($NOTES/journal/YYYY-MM-DD.md)
+    index           Open main index ($NOTES/index.md)
+    page [path]     Open/create page
+                      - No arg: fzf select directory, then prompt for page name
+                      - With arg: open $NOTES/<path>.md directly
+    search [-i]     Fuzzy find markdown files
+                      - -i: show file preview in fzf
+    rg <pattern>    Ripgrep search across all notes
+
+EXAMPLES
+    note journal              # Today's journal entry
+    note page projects/todo   # Open $NOTES/projects/todo.md
+    note search -i            # Browse files with preview
+    note rg "TODO"            # Find all TODOs
+EOF
+}
+
 case "$1" in
+    help)
+        show_help
+        exit 0
+        ;;
     journal)
-        vim -c "WikiJournal"
+        vim "$NOTES/journal/$(date +%Y-%m-%d).md" 
         ;;
     index)
-        vim -c "WikiIndex"
+        vim "$NOTES/index.md" 
         ;;
     page)
-        vim -c "WikiOpen"
+        if [ -z "$2" ]; then
+            dir=$(find "$NOTES" -maxdepth 1 -mindepth 1 -type d -not -path '*/[_.]*' | fzf) && [ -n "$dir" ] || exit 0
+            read -rp "Open page (or create new): " page
+            [ -n "$page" ] && vim "$dir/$page.md"
+        else
+            vim "$NOTES/$2.md"
+        fi
         ;;
     search)
-        vim -c "WikiPages"
+        if [ "$2" = "-i" ]; then
+            file=$(find "$NOTES" -type f -name "*.md" | fzf --preview 'cat {}') && [ -n "$file" ] && vim "$file"
+        else
+            file=$(find "$NOTES" -type f -name "*.md" | fzf) && [ -n "$file" ] && vim "$file"
+        fi
         ;;
     rg)
         rg "$2" "$NOTES"
         ;;
     *)
-        echo "Usage: note <command> <args>"
-        echo "Commands: journal index page search rg"
+        show_help
         exit 1
         ;;
 esac
