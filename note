@@ -8,7 +8,8 @@ USAGE
     note <command> [args]
 
 COMMANDS
-    journal         Open today's journal ($NOTES/journal/YYYY-MM-DD.md)
+    journal [last]  Open today's journal, or last entry with 'last'
+    journals        Browse journals with fzf preview
     index           Open main index ($NOTES/index.md)
     page [path]     Open/create page
                       - No arg: fzf select directory, then prompt for page name
@@ -31,7 +32,12 @@ case "$1" in
         exit 0
         ;;
     journal)
-        vim "$NOTES/journal/$(date +%Y-%m-%d).md" 
+        if [ "$2" = "last" ]; then
+            file=$(find "$NOTES/journal" -type f -name "*.md" | sort -r | head -1)
+            [ -n "$file" ] && vim "$file"
+        else
+            vim "$NOTES/journal/$(date +%Y-%m-%d).md"
+        fi
         ;;
     index)
         vim "$NOTES/index.md" 
@@ -44,6 +50,9 @@ case "$1" in
         else
             vim "$NOTES/$2.md"
         fi
+        ;;
+    journals)
+        file=$(find "$NOTES/journal" -type f -name "*.md" | sort -r | fzf --preview 'cat {}') && [ -n "$file" ] && vim "$file"
         ;;
     search)
         if [ "$2" = "-i" ]; then
