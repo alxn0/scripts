@@ -1,0 +1,1965 @@
+#!/usr/bin/env python3
+"""
+timereport - Zeit time tracking visualizer
+
+Generates various time reports from zeit export data.
+Reads JSON from stdin (zeit export -f json | timereport).
+Requires Python 3.10+.
+
+Usage:
+    zeit export -f json | timereport [dimensions...] [--period EXPR]
+
+Examples:
+    zeit export -f json | timereport project
+    zeit export -f json | timereport dailycal --period week
+"""
+
+# ============================================================================
+# SECTION 1: IMPORTS & CONSTANTS
+# ============================================================================
+
+import sys
+import json
+import re
+import argparse
+from datetime import datetime, timedelta
+from dataclasses import dataclass, replace
+from collections import defaultdict
+
+# Constants
+TEMPORAL_DIMS = {'day', 'week', 'month', 'year'}
+CATEGORICAL_DIMS = {'project', 'tag'}
+
+DAY_NAMES_SHORT = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+DAY_NAMES_FULL = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+
+MONTH_NAMES_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                     'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+MONTH_NAMES_FULL = ['January', 'February', 'March', 'April', 'May', 'June',
+                    'July', 'August', 'September', 'October', 'November', 'December']
+
+SECONDS_PER_DAY = 86400
+SECONDS_PER_HOUR = 3600
+
+# Sparse format constants
+SPARSE_BOX_HEIGHT = 6
+SPARSE_GAP_HEIGHT = 1
+
+# Display constants
+NO_TAG_LABEL = "(no tag)"
+NO_PROJECT_LABEL = "(no project)"
+ADJACENCY_TOLERANCE_SEC = 60
+GRID_DAY_COL_WIDTH = 19
+COMPACT_FORMAT_WIDTH = 69
+CROSSTAB_TRANSPOSE_THRESHOLD = 6
+CROSSTAB_COL_WIDTH = 8
+
+
+# ============================================================================
+# SECTION 2: DATA MODELS
+# ============================================================================
+
+@dataclass
+class Segment:
+    """Single time tracking segment (after midnight splitting)"""
+    project: str | None
+    tags: list[str]
+    description: str
+    start_epoch: int
+    end_epoch: int
+    duration_sec: int
+    day: str          # "Mon", "Tue", ...
+    day_num: int      # 0-6 (Mon=0)
+    week: int         # ISO week 1-52
+    month: str        # "Jan", "Feb", ...
+    month_num: int    # 1-12
+    year: int
+
+
+@dataclass
+class DimensionSpec:
+    """Specification of a reporting dimension"""
+    name: str
+    is_temporal: bool
+    is_categorical: bool
+
+
+@dataclass
+class CommandSpec:
+    """Parsed command specification"""
+    command_type: str  # "dimension_report", "dailycal", "default_1d"
+    dimensions: list[DimensionSpec]
+    period_expr: str | None
+    flags: dict[str, bool]  # compact, sparse
+
+
+@dataclass
+class AggregatedData:
+    """Aggregated segments by dimensions"""
+    data: dict
+    dimensions: list[str]
+    total_duration: int
+    period_range: tuple[int, int] | None  # (begin_epoch, end_epoch)
+    segments: list[Segment]  # Keep original segments for daily calendar
+
+
+@dataclass
+class BoxPlacement:
+    """Placement of a segment box in the daily calendar grid"""
+    segment: Segment
+    day_idx: int       # Day of week (0-6, Mon-Sun)
+    start_row: int     # Grid row where box starts
+    end_row: int       # Grid row where box ends (exclusive)
+    column: int        # Sub-column within day (0-2 for overlaps)
+
+
+# ============================================================================
+# SECTION 3: COMMAND ROUTING & VALIDATION
+# ============================================================================
+
+def detect_command_type(args: list[str]) -> tuple[str, list[str]]:
+    """
+    Detect command type from first positional argument.
+    Returns: (command_type, remaining_args)
+    """
+    if not args:
+        return ("default_1d", [])
+
+    match args[0]:
+        case "dailycal":
+            return ("dailycal", args[1:])
+        case _:
+            # Regular dimension report
+            return ("dimension_report", args)
+
+
+def parse_dimensions(args: list[str]) -> list[DimensionSpec]:
+    """Parse dimension arguments and validate combinations"""
+    if not args:
+        raise ValueError("At least one dimension required")
+
+    dims = []
+    for arg in args:
+        match arg:
+            case "project" | "tag":
+                dims.append(DimensionSpec(arg, False, True))
+            case "day" | "week" | "month" | "year":
+                dims.append(DimensionSpec(arg, True, False))
+            case _:
+                raise ValueError(f"Invalid dimension: {arg}")
+
+    # Validate dimension combinations
+    validate_dimension_combo(dims)
+    return dims
+
+
+def validate_dimension_combo(dims: list[DimensionSpec]) -> None:
+    """Validate dimension combinations"""
+    if len(dims) > 2:
+        raise ValueError("Maximum 2 dimensions supported")
+    if len(dims) == 2:
+        has_cat = any(d.is_categorical for d in dims)
+        has_temp = any(d.is_temporal for d in dims)
+        if not (has_cat and has_temp):
+            raise ValueError(
+                "2D reports require one categorical (project, tag) "
+                "and one temporal (day, week, month, year) dimension"
+            )
+
+
+def build_command_spec(args: argparse.Namespace) -> CommandSpec:
+    """Build complete command specification from parsed CLI args"""
+    # Detect command type
+    cmd_type, dim_args = detect_command_type(args.dimensions)
+
+    # Handle command aliases and special cases
+    match cmd_type:
+        case "dailycal":
+            dimensions = []  # Special handling - no dimension aggregation
+            # Allow inline period: `dailycal week` == `dailycal --period week`
+            if dim_args:
+                if args.period:
+                    raise ValueError("Cannot specify both inline period and --period")
+                args.period = dim_args[0]
+        case "dimension_report":
+            dimensions = parse_dimensions(dim_args)
+        case "default_1d":
+            dimensions = parse_dimensions(["project"])
+
+    return CommandSpec(
+        command_type=cmd_type,
+        dimensions=dimensions,
+        period_expr=args.period,
+        flags={
+            "compact": getattr(args, 'compact', False),
+            "sparse": getattr(args, 'sparse', False),
+        }
+    )
+
+
+# ============================================================================
+# SECTION 4: DATA PIPELINE
+# ============================================================================
+
+# Stage 4.1: Data Loading
+# ------------------------
+
+def load_zeit_data() -> dict:
+    """Load zeit export JSON from stdin."""
+    if sys.stdin.isatty():
+        raise RuntimeError(
+            "No data on stdin. Usage: zeit export -f json | timereport ..."
+        )
+
+    json_data = sys.stdin.read()
+    if not json_data or json_data.strip() == "":
+        raise RuntimeError("No data received from stdin")
+
+    try:
+        return json.loads(json_data)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Failed to parse JSON: {e}")
+
+
+# Stage 4.2: Segment Extraction & Validation
+# -------------------------------------------
+
+def parse_rfc3339(timestamp: str) -> int:
+    """Parse RFC3339 timestamp to epoch seconds."""
+    # Handle Z suffix and timezone offsets
+    ts = timestamp.replace("Z", "+00:00")
+    dt = datetime.fromisoformat(ts)
+    return int(dt.timestamp())
+
+
+def extract_segments(blocks: dict) -> list[tuple[dict, int, int]]:
+    """
+    Extract raw segments from zeit export blocks.
+    Returns: list of (task_context, start_epoch, end_epoch)
+    """
+    segments = []
+    for block in blocks.values():
+        # Skip non-block entries (config, activeblock, etc.)
+        if not isinstance(block, dict):
+            continue
+        if "start" not in block or "end" not in block:
+            continue
+
+        try:
+            start = parse_rfc3339(block["start"])
+            end = parse_rfc3339(block["end"])
+        except (ValueError, TypeError):
+            continue
+
+        if not validate_segment(start, end):
+            continue
+
+        # Map zeit fields: project_sid -> project, task_sid -> description
+        project = block.get("project_sid", "")
+        task_sid = block.get("task_sid", "")
+        note = block.get("note", "")
+        # Use task_sid as description, append note if present
+        description = task_sid
+        if note:
+            description = f"{task_sid}: {note}" if task_sid else note
+
+        context = {
+            "project": project or None,
+            "tags": [],
+            "description": description,
+        }
+        segments.append((context, start, end))
+
+    return segments
+
+
+def validate_segment(start: int, end: int) -> bool:
+    """Validate segment times"""
+    if start is None or end is None:
+        return False
+    if start >= end:  # No negative or zero durations
+        return False
+    if start < 0 or end < 0:  # No time travel
+        return False
+    return True
+
+
+# Stage 4.3: Midnight Splitting & Temporal Extraction
+# ---------------------------------------------------
+
+def preprocess_segments(raw_segments: list[tuple[dict, int, int]]) -> list[Segment]:
+    """Split at midnight and extract temporal dimensions"""
+    processed = []
+
+    for context, start, end in raw_segments:
+        # Split at midnight boundaries
+        split_ranges = midnight_split(start, end)
+
+        for seg_start, seg_end in split_ranges:
+            # Extract temporal dimensions from start time
+            temporal = extract_temporal_dims(seg_start)
+
+            processed.append(Segment(
+                project=context["project"],
+                tags=context["tags"],
+                description=context["description"],
+                start_epoch=seg_start,
+                end_epoch=seg_end,
+                duration_sec=seg_end - seg_start,
+                **temporal
+            ))
+
+    return processed
+
+
+def midnight_split(start: int, end: int) -> list[tuple[int, int]]:
+    """Split segment at midnight (00:00:00) boundaries"""
+    segments = []
+    current = start
+
+    while current < end:
+        # Convert current epoch to local datetime
+        current_dt = datetime.fromtimestamp(current)
+
+        # Find the end of the current day (23:59:59) in local timezone
+        current_day_end_dt = current_dt.replace(
+            hour=23, minute=59, second=59, microsecond=0
+        )
+        current_day_end = int(current_day_end_dt.timestamp())
+
+        if end <= current_day_end:
+            # Segment ends before midnight
+            segments.append((current, end))
+            break
+        else:
+            # Segment crosses midnight
+            segments.append((current, current_day_end))
+            current = current_day_end + 1  # 00:00:00 next day
+
+    return segments
+
+
+def extract_temporal_dims(epoch: int) -> dict:
+    """Extract all temporal dimensions from epoch time"""
+    dt = datetime.fromtimestamp(epoch)
+    iso = dt.isocalendar()
+
+    return {
+        "day": DAY_NAMES_SHORT[dt.weekday()],
+        "day_num": dt.weekday(),
+        "week": iso.week,
+        "month": MONTH_NAMES_SHORT[dt.month - 1],
+        "month_num": dt.month,
+        "year": dt.year
+    }
+
+
+# Stage 4.4: Tag Expansion
+# ------------------------
+
+def expand_tags(segments: list[Segment]) -> list[Segment]:
+    """
+    Expand segments with multiple tags into separate segments.
+    Called only when 'tag' dimension is requested.
+    """
+    expanded = []
+    for seg in segments:
+        if seg.tags:
+            for tag in seg.tags:
+                # Create copy with single tag
+                expanded.append(replace(seg, tags=[tag]))
+        else:
+            # No tags -> keep as placeholder
+            expanded.append(replace(seg, tags=[NO_TAG_LABEL]))
+
+    return expanded
+
+
+# Stage 4.5: Period Filtering
+# ---------------------------
+
+def apply_period_filter(segments: list[Segment], period_expr: str) -> list[Segment]:
+    """Filter segments by period expression"""
+    if not period_expr:
+        return segments
+
+    begin, end = parse_period_expression(period_expr)
+
+    return [
+        seg for seg in segments
+        if seg.start_epoch < end and seg.end_epoch > begin
+    ]
+
+
+def parse_period_expression(expr: str) -> tuple[int, int]:
+    """
+    Parse period expression to (begin_epoch, end_epoch).
+    Uses only datetime stdlib (no dateutil).
+    """
+    now = datetime.now()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    match expr:
+        case "today":
+            begin = today_start
+            end = today_start + timedelta(days=1) - timedelta(seconds=1)
+
+        case "yesterday":
+            begin = today_start - timedelta(days=1)
+            end = today_start - timedelta(seconds=1)
+
+        case "week":
+            # Current week (Monday to Sunday)
+            week_start = today_start - timedelta(days=now.weekday())
+            begin = week_start
+            end = week_start + timedelta(days=7) - timedelta(seconds=1)
+
+        case "lastweek":
+            week_start = today_start - timedelta(days=now.weekday() + 7)
+            begin = week_start
+            end = week_start + timedelta(days=7) - timedelta(seconds=1)
+
+        case "month":
+            month_start = today_start.replace(day=1)
+            begin = month_start
+            # Last day of month
+            next_month = (month_start + timedelta(days=32)).replace(day=1)
+            end = next_month - timedelta(seconds=1)
+
+        case "lastmonth":
+            month_start = today_start.replace(day=1)
+            last_month_start = (month_start - timedelta(days=1)).replace(day=1)
+            begin = last_month_start
+            end = month_start - timedelta(seconds=1)
+
+        case "year":
+            year_start = today_start.replace(month=1, day=1)
+            begin = year_start
+            end = year_start.replace(year=year_start.year + 1) - timedelta(seconds=1)
+
+        case "lastyear":
+            year_start = today_start.replace(month=1, day=1, year=now.year - 1)
+            begin = year_start
+            end = year_start.replace(year=year_start.year + 1) - timedelta(seconds=1)
+
+        case _:
+            # Try multi-period pattern (Ndays, Nweeks, etc.)
+            begin, end = parse_multi_period(expr, today_start)
+
+    return (int(begin.timestamp()), int(end.timestamp()))
+
+
+def parse_multi_period(expr: str, today_start: datetime) -> tuple[datetime, datetime]:
+    """Parse multi-period expressions like '3weeks', '2months'"""
+    match = re.match(r'^(\d+)(days?|weeks?|months?|years?)$', expr.lower())
+    if not match:
+        raise ValueError(f"Invalid period expression: {expr}")
+
+    count = int(match.group(1))
+    unit = match.group(2).rstrip('s')  # Remove trailing 's' if present
+
+    if count < 2:
+        raise ValueError(f"Multi-period count must be >= 2: {expr}")
+
+    end = today_start + timedelta(days=1) - timedelta(seconds=1)
+
+    match unit:
+        case "day":
+            begin = today_start - timedelta(days=count - 1)
+        case "week":
+            # Go back to Monday of current week, then back (count-1) more weeks
+            current_week_start = today_start - timedelta(days=today_start.weekday())
+            begin = current_week_start - timedelta(weeks=count - 1)
+        case "month":
+            # Current month + (count-1) previous months
+            begin = today_start.replace(day=1)
+            for _ in range(count - 1):
+                begin = (begin - timedelta(days=1)).replace(day=1)
+        case "year":
+            begin = today_start.replace(month=1, day=1, year=today_start.year - count + 1)
+        case _:
+            raise ValueError(f"Invalid period unit: {unit}")
+
+    return (begin, end)
+
+
+# Stage 4.6: Aggregation
+# ----------------------
+
+def get_dimension_value(seg: Segment, dim: str) -> str:
+    """Get dimension value from segment"""
+    match dim:
+        case "project":
+            if seg.project:
+                return seg.project
+            return NO_PROJECT_LABEL
+        case "tag":
+            if seg.tags and seg.tags[0] != NO_TAG_LABEL:
+                return seg.tags[0]
+            return NO_TAG_LABEL
+        case "day":
+            return seg.day
+        case "week":
+            return f"W{seg.week}"
+        case "month":
+            return seg.month
+        case "year":
+            return str(seg.year)
+        case _:
+            raise ValueError(f"Unknown dimension: {dim}")
+
+
+def aggregate_by_dimensions(
+    segments: list[Segment],
+    dimensions: list[str],
+) -> AggregatedData:
+    """Aggregate segments by specified dimensions"""
+    if not dimensions:
+        # No dimensions - just return total
+        total = sum(seg.duration_sec for seg in segments)
+        period = None
+        if segments:
+            period = (
+                min(s.start_epoch for s in segments),
+                max(s.end_epoch for s in segments)
+            )
+        return AggregatedData(
+            data={},
+            dimensions=[],
+            total_duration=total,
+            period_range=period,
+            segments=segments
+        )
+
+    # Build nested dictionary keyed by dimensions
+    data = {}
+
+    for seg in segments:
+        # Build composite key from dimension values
+        keys = [get_dimension_value(seg, dim) for dim in dimensions]
+
+        # Navigate/create nested dict structure
+        current = data
+        for i, key in enumerate(keys[:-1]):
+            if key not in current:
+                current[key] = {}
+            current = current[key]
+
+        # Add/update leaf value
+        last_key = keys[-1]
+        if last_key not in current:
+            current[last_key] = 0
+        current[last_key] += seg.duration_sec
+
+    # Calculate total and period range
+    total = sum(seg.duration_sec for seg in segments)
+    period = None
+    if segments:
+        period = (
+            min(s.start_epoch for s in segments),
+            max(s.end_epoch for s in segments)
+        )
+
+    return AggregatedData(
+        data=data,
+        dimensions=dimensions,
+        total_duration=total,
+        period_range=period,
+        segments=segments
+    )
+
+
+# ============================================================================
+# SECTION 5: RENDERING STRATEGIES (COMPOSITION PATTERN)
+# ============================================================================
+
+# Formatting Strategies
+# ---------------------
+
+class DurationFormatter:
+    """Format durations in hours"""
+
+    def format(self, seconds: int) -> str:
+        """Format duration as X.Xh"""
+        hours = seconds / SECONDS_PER_HOUR
+        return f"{hours:.1f}h"
+
+    def format_compact(self, seconds: int) -> str:
+        """Format duration without 'h' suffix"""
+        hours = seconds / SECONDS_PER_HOUR
+        return f"{hours:.1f}"
+
+
+class PercentageFormatter:
+    """Format percentages"""
+
+    def format(self, value: float, total: float) -> str:
+        """Format percentage"""
+        if total == 0:
+            return "(0.0%)"
+        pct = (value / total) * 100
+        return f"({pct:.1f}%)"
+
+
+class DateFormatter:
+    """Format dates and time periods"""
+
+    def format_day(self, day_num: int, full: bool = False) -> str:
+        """Format day name"""
+        return DAY_NAMES_FULL[day_num] if full else DAY_NAMES_SHORT[day_num]
+
+    def format_week(self, week_num: int, verbose: bool = False) -> str:
+        """Format week number"""
+        return f"W{week_num}" if not verbose else f"Week {week_num}"
+
+    def format_month(self, month_num: int, full: bool = False, with_year: int | None = None) -> str:
+        """Format month name"""
+        month_name = MONTH_NAMES_FULL[month_num - 1] if full else MONTH_NAMES_SHORT[month_num - 1]
+        if with_year:
+            return f"{month_name} {with_year}"
+        return month_name
+
+    def format_period_range(self, begin: int, end: int) -> str:
+        """Format period range for headers (e.g., 'Dec 15 (2024) - Jan 4 (2025)')"""
+        begin_dt = datetime.fromtimestamp(begin)
+        end_dt = datetime.fromtimestamp(end)
+
+        begin_str = f"{MONTH_NAMES_SHORT[begin_dt.month - 1]} {begin_dt.day:02d} ({begin_dt.year})"
+        end_str = f"{MONTH_NAMES_SHORT[end_dt.month - 1]} {end_dt.day:02d} ({end_dt.year})"
+
+        return f"{begin_str} - {end_str}"
+
+
+# Border/Table Strategies
+# -----------------------
+
+class BorderDrawer:
+    """Draw table borders and separators"""
+
+    STYLES = {
+        "single": {"h": "─", "v": "│", "sep": "─"},
+        "double": {"h": "═", "v": "║", "sep": "═"},
+        "none": {"h": "-", "v": "|", "sep": "-"}
+    }
+
+    def draw_separator(self, width: int, style: str = "single") -> str:
+        """Draw horizontal separator"""
+        char = self.STYLES[style]["sep"]
+        return char * width
+
+    def draw_header_separator(self, width: int) -> str:
+        """Draw header separator (double line)"""
+        return self.draw_separator(width, "double")
+
+
+# ============================================================================
+# SECTION 6: MAIN RENDERER (COMPOSITION-BASED)
+# ============================================================================
+
+class Renderer:
+    """Main renderer using composed strategies"""
+
+    def __init__(self):
+        self.duration_fmt = DurationFormatter()
+        self.pct_fmt = PercentageFormatter()
+        self.date_fmt = DateFormatter()
+        self.border = BorderDrawer()
+
+    def render(self, data: AggregatedData, spec: CommandSpec) -> str:
+        """Route to appropriate rendering method"""
+        match (len(data.dimensions), spec.command_type):
+            case (_, "dailycal"):
+                return self._render_daily_calendar(data, spec)
+            case (0, _):
+                return self._render_total_only(data)
+            case (1, _):
+                return self._render_1d(data, spec)
+            case (2, _):
+                return self._render_2d(data, spec)
+            case _:
+                raise ValueError(f"Unsupported dimension combination: {data.dimensions}")
+
+    def _render_total_only(self, data: AggregatedData) -> str:
+        """Render when no dimensions specified"""
+        duration = self.duration_fmt.format(data.total_duration)
+        return f"Total: {duration}\n"
+
+    def _render_1d(self, data: AggregatedData, spec: CommandSpec) -> str:
+        """Render 1D list format"""
+        lines = []
+        dim = data.dimensions[0]
+
+        # Header
+        header = f"{dim.upper()}"
+        if data.period_range:
+            period_str = self.date_fmt.format_period_range(*data.period_range)
+            header += f": {period_str}"
+
+        lines.append(header)
+        lines.append(self.border.draw_header_separator(len(header)))
+        lines.append("")
+        lines.append(self.border.draw_separator(len(header)))
+
+        # Sort items
+        items = sorted(data.data.items())
+
+        # Data rows
+        for key, value in items:
+            duration = self.duration_fmt.format_compact(value)
+            pct = self.pct_fmt.format(value, data.total_duration)
+            lines.append(f"{key:<20} {duration:>8}  {pct}")
+
+        # Total row
+        lines.append(self.border.draw_separator(len(header)))
+        total_dur = self.duration_fmt.format_compact(data.total_duration)
+        lines.append(f"{'Total':<20} {total_dur:>8}  (100.0%)")
+        lines.append("")
+        lines.append(self.border.draw_header_separator(len(header)))
+        lines.append("")
+
+        return '\n'.join(lines)
+
+    @staticmethod
+    def _temporal_sort_key(dim: str, value: str) -> int:
+        """Sort key for temporal dimension values."""
+        match dim:
+            case "day":
+                return DAY_NAMES_SHORT.index(value) if value in DAY_NAMES_SHORT else 99
+            case "week":
+                # "W01" -> 1
+                return int(value[1:]) if value.startswith("W") else 99
+            case "month":
+                return MONTH_NAMES_SHORT.index(value) if value in MONTH_NAMES_SHORT else 99
+            case "year":
+                return int(value)
+            case _:
+                return 0
+
+    def _render_2d(self, data: AggregatedData, spec: CommandSpec) -> str:
+        """Render 2D cross-tabulation table.
+
+        Dimensions are always ordered categorical × temporal.
+        Auto-transposes when temporal columns exceed threshold.
+        """
+        dims = data.dimensions
+        # Identify which is categorical, which is temporal
+        cat_dim_idx = next(i for i, d in enumerate(spec.dimensions) if d.is_categorical)
+        temp_dim_idx = 1 - cat_dim_idx
+        cat_dim = dims[cat_dim_idx]
+        temp_dim = dims[temp_dim_idx]
+
+        # Build cross-tab: {cat_val: {temp_val: seconds}}
+        crosstab = defaultdict(lambda: defaultdict(int))
+        all_temp_vals = set()
+        for seg in data.segments:
+            cat_val = get_dimension_value(seg, cat_dim)
+            temp_val = get_dimension_value(seg, temp_dim)
+            crosstab[cat_val][temp_val] += seg.duration_sec
+            all_temp_vals.add(temp_val)
+
+        # Sort temporal values chronologically
+        sorted_temp = sorted(all_temp_vals, key=lambda v: self._temporal_sort_key(temp_dim, v))
+
+        # Sort categorical values by total descending
+        cat_totals = {cat: sum(vals.values()) for cat, vals in crosstab.items()}
+        sorted_cat = sorted(cat_totals, key=lambda c: cat_totals[c], reverse=True)
+
+        # Auto-transpose: if too many temporal values, swap axes
+        transposed = len(sorted_temp) > CROSSTAB_TRANSPOSE_THRESHOLD
+        if transposed:
+            row_labels = sorted_temp
+            col_labels = sorted_cat
+            row_dim, col_dim = temp_dim, cat_dim
+
+            def cell(row, col):
+                return crosstab[col][row]
+
+            def row_total(row):
+                return sum(crosstab[cat][row] for cat in sorted_cat)
+
+            def col_total(col):
+                return cat_totals[col]
+        else:
+            row_labels = sorted_cat
+            col_labels = sorted_temp
+            row_dim, col_dim = cat_dim, temp_dim
+
+            def cell(row, col):
+                return crosstab[row][col]
+
+            def row_total(row):
+                return cat_totals[row]
+
+            def col_total(col):
+                return sum(crosstab[cat][col] for cat in sorted_cat)
+
+        # Layout
+        min_cw = max((len(c) for c in col_labels), default=0) + 2
+        cw = max(CROSSTAB_COL_WIDTH, min_cw)
+        label_width = max(len(r) for r in row_labels) + 2
+        label_width = max(label_width, 12)
+        table_width = label_width + (len(col_labels) + 1) * cw
+
+        # Header
+        lines = []
+        title = f"{row_dim.upper()} × {col_dim.upper()}"
+        if data.period_range:
+            period_str = self.date_fmt.format_period_range(*data.period_range)
+            title += f" ({period_str})"
+        lines.append(title)
+        lines.append(self.border.draw_header_separator(table_width))
+        lines.append("")
+
+        # Column headers
+        header_line = " " * label_width
+        for col in col_labels:
+            header_line += f"{col:>{cw}}"
+        header_line += f"{'Total':>{cw}}"
+        lines.append(header_line)
+        lines.append(self.border.draw_separator(table_width))
+
+        # Data rows
+        for row in row_labels:
+            line = f"{row:<{label_width}}"
+            for col in col_labels:
+                val = cell(row, col)
+                if val == 0:
+                    line += f"{'·':>{cw}}"
+                else:
+                    line += f"{self.duration_fmt.format_compact(val):>{cw}}"
+            rt = row_total(row)
+            line += f"{self.duration_fmt.format_compact(rt):>{cw}}"
+            lines.append(line)
+
+        # Total row
+        lines.append(self.border.draw_separator(table_width))
+        total_line = f"{'Total':<{label_width}}"
+        for col in col_labels:
+            ct = col_total(col)
+            total_line += f"{self.duration_fmt.format_compact(ct):>{cw}}"
+        total_line += f"{self.duration_fmt.format_compact(data.total_duration):>{cw}}"
+        lines.append(total_line)
+
+        lines.append("")
+        lines.append(self.border.draw_header_separator(table_width))
+        lines.append("")
+
+        return '\n'.join(lines)
+
+    def _render_daily_calendar(self, data: AggregatedData, spec: CommandSpec) -> str:
+        """Render daily calendar (grid/compact/sparse)"""
+        if spec.flags.get("sparse"):
+            return self._render_daily_sparse(data, spec)
+        elif spec.flags["compact"]:
+            return self._render_daily_compact(data, spec)
+        else:
+            return self._render_daily_grid(data, spec)
+
+    @staticmethod
+    def _group_segments_by_week(segments: list[Segment]) -> dict:
+        """Group segments into {(iso_year, iso_week): {weekday: [segments]}}"""
+        by_week = defaultdict(lambda: defaultdict(list))
+        for seg in segments:
+            dt = datetime.fromtimestamp(seg.start_epoch)
+            iso = dt.isocalendar()
+            by_week[(iso.year, iso.week)][dt.weekday()].append(seg)
+        return by_week
+
+    @staticmethod
+    def _flatten_week_segments(week_segs_by_day: dict) -> list[Segment]:
+        """Collect all segments for a week into a flat list."""
+        return [seg for day_segs in week_segs_by_day.values() for seg in day_segs]
+
+    @staticmethod
+    def _week_start_date(segments: list[Segment]) -> datetime:
+        """Monday of the week containing the earliest segment."""
+        first_seg = min(segments, key=lambda s: s.start_epoch)
+        first_dt = datetime.fromtimestamp(first_seg.start_epoch)
+        return first_dt - timedelta(days=first_dt.weekday())
+
+    def _render_week_footer(self, lines: list[str], week_segs_by_day: dict, col_width: int, total_width: int) -> None:
+        """Render daily totals, week total, and closing separator."""
+        totals_line = "Daily Total:    "
+        for day_idx in range(7):
+            day_total = sum(seg.duration_sec for seg in week_segs_by_day.get(day_idx, []))
+            if day_total > 0:
+                total_str = self.duration_fmt.format(day_total)
+                totals_line += f"{total_str:<{col_width}} "
+            else:
+                totals_line += f"{'-':<{col_width}} "
+
+        lines.append(totals_line.rstrip())
+        lines.append(self.border.draw_separator(total_width))
+
+        week_total = sum(seg.duration_sec for seg in self._flatten_week_segments(week_segs_by_day))
+        lines.append(f"Week Total: {self.duration_fmt.format(week_total)}")
+
+        lines.append(self.border.draw_header_separator(total_width))
+        lines.append("")
+
+    def _render_daily_sparse(self, data: AggregatedData, spec: CommandSpec) -> str:
+        """Sparse format with fixed-height boxes and gaps"""
+        lines = []
+        by_week = self._group_segments_by_week(data.segments)
+        sorted_weeks = sorted(by_week.keys())
+        if not sorted_weeks:
+            return "No time segments to display\n"
+
+        for week_year, week_num in sorted_weeks:
+            week_segs_by_day = by_week[(week_year, week_num)]
+            all_week_segs = self._flatten_week_segments(week_segs_by_day)
+            if not all_week_segs:
+                continue
+
+            week_start = self._week_start_date(all_week_segs)
+            placements = self._place_boxes_sparse(week_segs_by_day)
+            week_lines = self._render_week_sparse(
+                placements, week_segs_by_day,
+                week_start, week_num, week_year, spec
+            )
+            lines.extend(week_lines)
+
+        return '\n'.join(lines)
+
+    def _render_daily_grid(self, data: AggregatedData, spec: CommandSpec) -> str:
+        """Grid format with box rendering"""
+        lines = []
+        by_week = self._group_segments_by_week(data.segments)
+        sorted_weeks = sorted(by_week.keys())
+        if not sorted_weeks:
+            return "No time segments to display\n"
+
+        for week_year, week_num in sorted_weeks:
+            week_segs_by_day = by_week[(week_year, week_num)]
+            all_week_segs = self._flatten_week_segments(week_segs_by_day)
+            if not all_week_segs:
+                continue
+
+            min_hour = min(datetime.fromtimestamp(seg.start_epoch).hour for seg in all_week_segs)
+            max_hour = max(datetime.fromtimestamp(seg.end_epoch).hour for seg in all_week_segs) + 1
+
+            week_start = self._week_start_date(all_week_segs)
+            placements = self._place_boxes_in_grid(week_segs_by_day, min_hour)
+            week_lines = self._render_week_grid(
+                placements, week_segs_by_day, min_hour, max_hour,
+                week_start, week_num, week_year, spec
+            )
+            lines.extend(week_lines)
+
+        return '\n'.join(lines)
+
+    def _place_boxes_in_grid(self, week_segs_by_day: dict, min_hour: int) -> list[BoxPlacement]:
+        """Place segments into grid positions using greedy column assignment"""
+        placements = []
+
+        for day_idx in range(7):
+            day_segs = week_segs_by_day.get(day_idx, [])
+            if not day_segs:
+                continue
+
+            # Sort by start time
+            sorted_segs = sorted(day_segs, key=lambda s: s.start_epoch)
+
+            # Track when each column becomes free (row index) and last segment in each column
+            column_free_at = [0, 0, 0]  # Support up to 3 columns
+            column_last_seg = [None, None, None]  # Last segment placed in each column
+
+            for seg in sorted_segs:
+                start_dt = datetime.fromtimestamp(seg.start_epoch)
+                end_dt = datetime.fromtimestamp(seg.end_epoch)
+
+                # Calculate row positions (15-min slots = 4 per hour)
+                start_row = (start_dt.hour - min_hour) * 4 + start_dt.minute // 15
+                end_row = (end_dt.hour - min_hour) * 4 + (end_dt.minute + 14) // 15
+
+                # Ensure minimum box height of 3 rows (top border + content + bottom border)
+                if end_row - start_row < 3:
+                    end_row = start_row + 3
+
+                # Check if this segment is adjacent to any previous segment (within 60 seconds)
+                adjacent_column = None
+                for col_idx in range(3):
+                    last_seg = column_last_seg[col_idx]
+                    if last_seg:
+                        time_gap = abs(last_seg.end_epoch - seg.start_epoch)
+                        if time_gap <= ADJACENCY_TOLERANCE_SEC:
+                            # Adjacent to last segment in this column - use same column
+                            adjacent_column = col_idx
+                            break
+
+                # Find available column
+                column = None
+                if adjacent_column is not None:
+                    # Force adjacent segments into same column
+                    column = adjacent_column
+                    column_free_at[column] = end_row
+                else:
+                    # Normal greedy column assignment
+                    for col_idx in range(3):
+                        if column_free_at[col_idx] <= start_row:
+                            column = col_idx
+                            column_free_at[col_idx] = end_row
+                            break
+
+                if column is None:
+                    # All columns full - skip
+                    continue
+
+                # Update last segment in column
+                column_last_seg[column] = seg
+
+                placements.append(BoxPlacement(
+                    segment=seg,
+                    day_idx=day_idx,
+                    start_row=start_row,
+                    end_row=end_row,
+                    column=column
+                ))
+
+        return placements
+
+    def _place_boxes_sparse(self, week_segs_by_day: dict) -> list[BoxPlacement]:
+        """
+        Place segments for sparse format (fixed-height boxes with gaps).
+        Returns list of BoxPlacement objects with vertical stack positions.
+        """
+        placements = []
+
+        for day_idx in range(7):
+            day_segs = week_segs_by_day.get(day_idx, [])
+            if not day_segs:
+                continue
+
+            # Sort by start time (chronological order)
+            sorted_segs = sorted(day_segs, key=lambda s: s.start_epoch)
+
+            # Track vertical position and column usage
+            current_row = 0
+            column_free_at = [0, 0, 0]  # Support up to 3 columns for overlaps
+            column_last_seg = [None, None, None]
+
+            for seg in sorted_segs:
+                # Calculate fixed box dimensions
+                start_row = current_row
+                end_row = start_row + SPARSE_BOX_HEIGHT
+
+                # Check for adjacent segments (within 60 seconds)
+                adjacent_column = None
+                for col_idx in range(3):
+                    last_seg = column_last_seg[col_idx]
+                    if last_seg:
+                        time_gap = abs(last_seg.end_epoch - seg.start_epoch)
+                        if time_gap <= ADJACENCY_TOLERANCE_SEC:
+                            # Adjacent to last segment in this column
+                            adjacent_column = col_idx
+                            break
+
+                # Find available column
+                column = None
+                overlaps_with_any = False
+                if adjacent_column is not None:
+                    # Force adjacent segments into same column
+                    column = adjacent_column
+                    column_free_at[column] = end_row
+                else:
+                    # Check for overlapping segments
+                    for col_idx in range(3):
+                        if column_free_at[col_idx] > start_row:
+                            overlaps_with_any = True
+                            break
+
+                    if overlaps_with_any:
+                        # Find first available column
+                        for col_idx in range(3):
+                            if column_free_at[col_idx] <= start_row:
+                                column = col_idx
+                                column_free_at[col_idx] = end_row
+                                break
+                    else:
+                        # No overlap - use column 0
+                        column = 0
+                        column_free_at[0] = end_row
+
+                if column is None:
+                    # All columns full - skip
+                    continue
+
+                # Update last segment in column
+                column_last_seg[column] = seg
+
+                placements.append(BoxPlacement(
+                    segment=seg,
+                    day_idx=day_idx,
+                    start_row=start_row,
+                    end_row=end_row,
+                    column=column
+                ))
+
+                # Move to next vertical position (after gap)
+                if not overlaps_with_any:
+                    current_row = end_row + SPARSE_GAP_HEIGHT
+
+        return placements
+
+    def _render_week_grid(self, placements, week_segs_by_day, min_hour, max_hour, week_start, week_num, week_year, spec):
+        """Render a week grid with boxes"""
+        lines = []
+        col_width = GRID_DAY_COL_WIDTH
+        rows_per_hour = 4
+        total_rows = (max_hour - min_hour) * rows_per_hour
+
+        # Header
+        week_end = week_start + timedelta(days=6)
+        start_month = MONTH_NAMES_SHORT[week_start.month - 1]
+        end_month = MONTH_NAMES_SHORT[week_end.month - 1]
+        header = f"DAILY CALENDAR: {start_month} {week_start.day} - {end_month} {week_end.day} (Week {week_num}, {week_year})"
+        lines.append(header)
+        total_width = 6 + (col_width + 1) * 7
+        lines.append(self.border.draw_header_separator(total_width))
+        lines.append("")
+
+        # Column headers
+        header_line = "      "
+        for day_idx in range(7):
+            day_dt = week_start + timedelta(days=day_idx)
+            date_str = f"{DAY_NAMES_FULL[day_idx]} ({day_dt.day})"
+            header_line += f"{date_str:^{col_width}} "
+        lines.append(header_line)
+        lines.append(self.border.draw_separator(total_width))
+
+        # Pre-index placements by day for efficient lookup
+        placements_by_day = defaultdict(list)
+        for p in placements:
+            placements_by_day[p.day_idx].append(p)
+
+        # Render grid rows
+        for row_idx in range(total_rows):
+            if row_idx % rows_per_hour == 0:
+                hour = min_hour + (row_idx // rows_per_hour)
+                time_label = f"{hour:02d}:00 "
+            else:
+                time_label = "      "
+
+            row_line = time_label
+            for day_idx in range(7):
+                cell_content = self._render_cell_with_boxes(
+                    placements_by_day[day_idx], day_idx, row_idx, col_width, spec
+                )
+                row_line += cell_content + " "
+            lines.append(row_line.rstrip())
+
+        lines.append(self.border.draw_separator(total_width))
+        self._render_week_footer(lines, week_segs_by_day, col_width, total_width)
+
+        return lines
+
+    def _render_week_sparse(self, placements, week_segs_by_day, week_start, week_num, week_year, spec):
+        """Render a week in sparse format (no time labels, stacked boxes)"""
+        lines = []
+        col_width = GRID_DAY_COL_WIDTH
+        total_rows = max((p.end_row for p in placements), default=0) if placements else 0
+
+        # Header
+        week_end = week_start + timedelta(days=6)
+        start_month = MONTH_NAMES_SHORT[week_start.month - 1]
+        end_month = MONTH_NAMES_SHORT[week_end.month - 1]
+        header = f"DAILY CALENDAR (SPARSE): {start_month} {week_start.day} - {end_month} {week_end.day} (Week {week_num}, {week_year})"
+        lines.append(header)
+        total_width = (col_width + 1) * 7
+        lines.append(self.border.draw_header_separator(total_width))
+        lines.append("")
+
+        # Column headers
+        header_line = ""
+        for day_idx in range(7):
+            day_dt = week_start + timedelta(days=day_idx)
+            date_str = f"{DAY_NAMES_FULL[day_idx]} ({day_dt.day})"
+            header_line += f"{date_str:^{col_width}} "
+        lines.append(header_line)
+        lines.append(self.border.draw_separator(total_width))
+
+        # Pre-index placements by day
+        placements_by_day = defaultdict(list)
+        for p in placements:
+            placements_by_day[p.day_idx].append(p)
+
+        for row_idx in range(total_rows):
+            row_line = ""
+            for day_idx in range(7):
+                cell_content = self._render_cell_with_boxes(
+                    placements_by_day[day_idx], day_idx, row_idx, col_width, spec
+                )
+                row_line += cell_content + " "
+            lines.append(row_line.rstrip())
+
+        lines.append(self.border.draw_separator(total_width))
+        self._render_week_footer(lines, week_segs_by_day, col_width, total_width)
+
+        return lines
+
+    def _render_cell_with_boxes(self, placements: list[BoxPlacement], day_idx: int, row_idx: int, col_width: int, spec: CommandSpec) -> str:
+        """Render a cell that may contain multiple boxes. Placements are pre-filtered for this day."""
+        active_boxes = [
+            p for p in placements
+            if p.start_row <= row_idx < p.end_row
+        ]
+
+        # Boxes starting at current or next row (for adjacency detection)
+        boxes_starting_next = [
+            p for p in placements
+            if p.start_row == row_idx or p.start_row == row_idx + 1
+        ]
+
+        if not active_boxes and not boxes_starting_next:
+            return " " * col_width
+
+        # Group boxes by column for adjacency detection
+        boxes_by_column = {}
+        for box in active_boxes:
+            boxes_by_column.setdefault(box.column, {'active': [], 'starting_next': None})
+            boxes_by_column[box.column]['active'].append(box)
+
+        for box in boxes_starting_next:
+            boxes_by_column.setdefault(box.column, {'active': [], 'starting_next': None})
+            boxes_by_column[box.column]['starting_next'] = box
+
+        # Sort columns
+        sorted_columns = sorted(boxes_by_column.keys())
+        num_columns = len([c for c in sorted_columns if boxes_by_column[c]['active']])
+
+        # Calculate sub-column widths
+        sub_width = (col_width - num_columns + 1) // num_columns if num_columns > 0 else col_width
+
+        # Track boxes that should be skipped (starting boxes after connecting border)
+        skip_boxes = set()
+
+        # Render
+        parts = []
+        for col_idx in sorted_columns:
+            col_data = boxes_by_column[col_idx]
+            active_in_col = col_data['active']
+            starting_next = col_data['starting_next']
+
+            # Check for connecting border: one box ending, one starting or overlapping, adjacent epochs
+            has_connecting_border = False
+            ending_box = None
+            adjacent_box = None
+
+            # Find box ending at this row (last content row)
+            ending_box = next((b for b in active_in_col if b.end_row - 1 == row_idx), None)
+
+            if ending_box:
+                # Check if segments are adjacent (within 60 seconds)
+                # First check boxes that are starting next
+                if starting_next:
+                    time_gap = abs(ending_box.segment.end_epoch - starting_next.segment.start_epoch)
+                    is_adjacent_row = (starting_next.start_row == row_idx or
+                                      starting_next.start_row == row_idx + 1)
+                    if time_gap <= ADJACENCY_TOLERANCE_SEC and is_adjacent_row:
+                        has_connecting_border = True
+                        adjacent_box = starting_next
+                        skip_boxes.add(id(starting_next))
+
+                # Also check other active boxes (for case where both start in same 15-min slot)
+                if not has_connecting_border:
+                    for box in active_in_col:
+                        if box != ending_box:
+                            time_gap = abs(ending_box.segment.end_epoch - box.segment.start_epoch)
+                            # Check if this box starts around where ending_box ends
+                            is_overlapping_adjacent = (box.start_row <= row_idx + 1)
+                            if time_gap <= ADJACENCY_TOLERANCE_SEC and is_overlapping_adjacent:
+                                has_connecting_border = True
+                                adjacent_box = box
+                                break
+
+            # Render boxes in this column
+            if has_connecting_border:
+                # Render connecting border instead of separate top/bottom borders
+                part = f"├{'─' * (sub_width - 2)}┤"
+                parts.append(part)
+            else:
+                # Check if multiple boxes start at the same row and are adjacent
+                # In this case, only render the one that ends first, skip the others
+                if len(active_in_col) > 1 and any(b.start_row == row_idx for b in active_in_col):
+                    # Find boxes starting at this row
+                    starting_here = [b for b in active_in_col if b.start_row == row_idx]
+                    # Check if any pair is adjacent
+                    boxes_to_skip_here = set()
+                    for i, box1 in enumerate(starting_here):
+                        for box2 in starting_here[i+1:]:
+                            time_gap = abs(box1.segment.end_epoch - box2.segment.start_epoch)
+                            if time_gap <= ADJACENCY_TOLERANCE_SEC:
+                                # Skip the longer box (the one that starts second chronologically)
+                                if box1.segment.end_epoch < box2.segment.start_epoch:
+                                    boxes_to_skip_here.add(id(box2))
+                                else:
+                                    boxes_to_skip_here.add(id(box1))
+                    skip_boxes.update(boxes_to_skip_here)
+
+                # Normal rendering
+                for box in active_in_col:
+                    # Skip boxes only at their start_row when a connecting border is rendered
+                    if id(box) in skip_boxes and box.start_row == row_idx:
+                        continue
+
+                    # Check if this box has an adjacent previous (skip top border)
+                    has_adj_prev = self._has_adjacent_prev(placements, box)
+                    skip_top = has_adj_prev and box.start_row <= row_idx
+
+                    has_adj_next = self._has_adjacent_next(placements, box)
+
+                    part = self._render_box_row(box, row_idx, sub_width, spec, skip_top_border=skip_top, has_adjacent_next=has_adj_next)
+                    parts.append(part)
+
+        result = "".join(parts)
+        return result.ljust(col_width)
+
+    def _has_adjacent_prev(self, placements: list[BoxPlacement], box: BoxPlacement) -> bool:
+        """Check if a box has an adjacent previous segment in the same column.
+        Placements must be pre-filtered for the same day."""
+        for p in placements:
+            if p.column == box.column:
+                time_gap = abs(p.segment.end_epoch - box.segment.start_epoch)
+                if time_gap <= ADJACENCY_TOLERANCE_SEC:
+                    if p.end_row == box.start_row:
+                        return True
+                    if p.start_row == box.start_row and p.end_row < box.end_row:
+                        return True
+        return False
+
+    def _has_adjacent_next(self, placements: list[BoxPlacement], box: BoxPlacement) -> bool:
+        """Check if a box has an adjacent next segment in the same column.
+        Placements must be pre-filtered for the same day."""
+        for p in placements:
+            if p.column == box.column and p != box:
+                time_gap = abs(box.segment.end_epoch - p.segment.start_epoch)
+                # Handles case where both start in same 15-min slot
+                is_adjacent_row = abs(p.start_row - box.end_row) <= 2
+                if time_gap <= ADJACENCY_TOLERANCE_SEC and is_adjacent_row:
+                    return True
+        return False
+
+    def _render_box_row(self, box: BoxPlacement, row_idx: int, width: int, spec: CommandSpec, skip_top_border: bool = False, has_adjacent_next: bool = False) -> str:
+        """Render one row of a box"""
+        relative_row = row_idx - box.start_row
+        box_height = box.end_row - box.start_row
+
+        if relative_row == 0:
+            if skip_top_border or (box_height == 2 and has_adjacent_next):
+                content = self._get_box_content_line(box.segment, relative_row, box_height, width - 2, spec)
+                return f"│{content}│"
+            else:
+                return f"┌{'─' * (width - 2)}┐"
+
+        if relative_row == box_height - 1:
+            return f"└{'─' * (width - 2)}┘"
+
+        content_row = relative_row - 1
+        content = self._get_box_content_line(box.segment, content_row, box_height, width - 2, spec)
+        return f"│{content}│"
+
+    def _calculate_layout_category(self, box_height: int, content_width: int) -> tuple[str, str]:
+        """
+        Calculate layout category for adaptive content display.
+        Returns: (width_category, height_category)
+        """
+        if content_width >= 14:
+            width_cat = 'wide'
+        elif content_width >= 7:
+            width_cat = 'medium'
+        else:
+            width_cat = 'narrow'
+
+        if box_height <= 2:
+            height_cat = 'tiny'
+        elif box_height <= 4:
+            height_cat = 'short'
+        elif box_height <= 6:
+            height_cat = 'medium'
+        elif box_height <= 8:
+            height_cat = 'tall'
+        else:
+            height_cat = 'very_tall'
+
+        return (width_cat, height_cat)
+
+    def _format_time_abbreviated(self, start_dt: datetime, end_dt: datetime, width: int) -> str:
+        """Format time range in abbreviated form based on available width"""
+        if width >= 13:
+            # Full format: "08:30-11:00"
+            return f"{start_dt:%H:%M}-{end_dt:%H:%M}"
+        elif width >= 7:
+            # Medium format: "08-11" (hour only)
+            return f"{start_dt:%H}-{end_dt:%H}"
+        elif width >= 5:
+            # Compact: "8-11"
+            return f"{start_dt.hour}-{end_dt.hour}"
+        else:
+            # Start only: "08"
+            return f"{start_dt:%H}"
+
+    def _truncate_smart(self, text: str, max_width: int, indicator: str = "..") -> str:
+        """Smart truncation with ellipsis"""
+        if len(text) <= max_width:
+            return text
+        if max_width <= len(indicator):
+            return text[:max_width]
+        return text[:max_width - len(indicator)] + indicator
+
+    def _format_tags_for_box(self, tags: list[str], width: int) -> str:
+        """
+        Format tags based on available width.
+        Returns formatted tag string or symbol.
+        """
+        if not tags or tags[0] == NO_TAG_LABEL:
+            return ""
+
+        if width <= 3:
+            # Use symbols
+            if len(tags) >= 3:
+                return "*"  # Many tags
+            elif len(tags) == 2:
+                return "##"  # Two tags
+            else:
+                return "#"  # One tag
+        elif width <= 11:
+            # Show first tag only: "[tag1]"
+            tag_str = f"[{tags[0]}]"
+            return self._truncate_smart(tag_str, width, "..]")
+        else:
+            # Show multiple tags: "[tag1, tag2]"
+            tag_str = "[" + ", ".join(tags) + "]"
+            return self._truncate_smart(tag_str, width, "...]")
+
+    def _has_description_icon(self) -> str:
+        """Icon indicating segment has description"""
+        return '"'
+
+    def _has_tags_icon(self, tags: list[str]) -> str:
+        """Icon indicating segment has tags"""
+        if not tags or tags[0] == NO_TAG_LABEL:
+            return ""
+        if len(tags) >= 3:
+            return "*"
+        elif len(tags) == 2:
+            return "##"
+        else:
+            return "#"
+
+    def _get_box_content_line(self, seg: Segment, relative_row: int, box_height: int, content_width: int, spec: CommandSpec) -> str:
+        """Get content for a specific line inside the box."""
+        width_cat, height_cat = self._calculate_layout_category(box_height, content_width)
+
+        project = seg.project or "?"
+        start_dt = datetime.fromtimestamp(seg.start_epoch)
+        end_dt = datetime.fromtimestamp(seg.end_epoch)
+        duration = f"{seg.duration_sec / 3600:.1f}h"
+        description = seg.description
+        tags = seg.tags
+
+        content_rows = box_height if box_height <= 2 else box_height - 2
+
+        # Build content lines
+        content_lines = self._build_content_lines(
+            project, start_dt, end_dt, duration, description, tags,
+            content_width, width_cat, height_cat, content_rows
+        )
+
+        # The caller (_render_box_row) always passes content_row = relative_row - 1
+        # So content_row is 0-based (0, 1, 2, ...) for content lines
+        # Use it directly as index into content_lines
+        content_index = relative_row
+
+        # Return appropriate line or padding
+        if 0 <= content_index < len(content_lines):
+            line = content_lines[content_index]
+            return line.ljust(content_width)
+        else:
+            return " " * content_width
+
+    def _build_content_lines(
+        self, project: str, start_dt: datetime, end_dt: datetime,
+        duration: str, description: str, tags: list[str],
+        width: int, width_cat: str, height_cat: str, content_rows: int,
+    ) -> list[str]:
+        """
+        Build list of content lines based on layout category and priority.
+        content_rows: Number of content rows available (excluding borders)
+        """
+        lines = []
+
+        # PRIORITY 1: Project (always show)
+        if height_cat == 'tiny' and width >= 10:
+            # Combine project + duration on one line for tiny boxes
+            proj_abbrev = project[:8] if len(project) > 8 else project
+            combined = f"{proj_abbrev} {duration}"
+            lines.append(self._truncate_smart(combined, width))
+        else:
+            # Normal: project on its own line
+            proj_line = self._truncate_smart(project, width, "..")
+            lines.append(proj_line)
+
+        # PRIORITY 2-5: Duration, Time, Description, Tags
+        # Remaining rows after project line
+        remaining_rows = content_rows - 1
+
+        # Strategy depends on width and height
+        if width_cat == 'wide':
+            lines.extend(self._build_wide_content(
+                start_dt, end_dt, duration, description, tags,
+                width, height_cat, remaining_rows
+            ))
+        elif width_cat == 'medium':
+            lines.extend(self._build_medium_content(
+                start_dt, end_dt, duration, description, tags,
+                width, height_cat, remaining_rows
+            ))
+        else:  # narrow
+            lines.extend(self._build_narrow_content(
+                start_dt, end_dt, duration, description, tags,
+                width, height_cat, remaining_rows
+            ))
+
+        return lines
+
+    def _build_wide_content(
+        self, start_dt: datetime, end_dt: datetime,
+        duration: str, description: str, tags: list[str],
+        width: int, height_cat: str, content_rows: int,
+    ) -> list[str]:
+        """Build content for WIDE width (14+ chars)"""
+        lines = []
+
+        if height_cat == 'tiny':
+            # Already have project+duration combined in first line
+            pass
+
+        elif height_cat == 'short':
+            # Row 2: Time
+            # Row 3: Duration
+            time_range = self._format_time_abbreviated(start_dt, end_dt, width)
+            lines.append(time_range)
+            if content_rows >= 3:
+                lines.append(duration)
+
+        elif height_cat == 'medium':
+            # Row 2: Time
+            # Row 3: Duration
+            # Row 4: Description (truncated)
+            time_range = self._format_time_abbreviated(start_dt, end_dt, width)
+            lines.append(time_range)
+            lines.append(duration)
+
+            if content_rows >= 4 and description:
+                desc_line = self._truncate_smart(description, width, "...")
+                lines.append(desc_line)
+
+        elif height_cat in ['tall', 'very_tall']:
+            # Row 2: Time
+            # Row 3: Duration
+            # Row 4: Description (truncated)
+            # Last row: Tags
+            time_range = self._format_time_abbreviated(start_dt, end_dt, width)
+            lines.append(time_range)
+            lines.append(duration)
+
+            # Calculate rows for description
+            rows_for_desc = content_rows - 3  # After project, time, duration
+
+            # Reserve last row for tags if they exist
+            has_tags = tags and tags[0] != NO_TAG_LABEL
+            if has_tags:
+                rows_for_desc -= 1
+
+            # Add description
+            if rows_for_desc > 0 and description:
+                desc_line = self._truncate_smart(description, width, "...")
+                lines.append(desc_line)
+
+            # Pad to second-to-last row if needed, then add tags
+            if has_tags:
+                while len(lines) < content_rows - 1:
+                    lines.append("")
+                tag_line = self._format_tags_for_box(tags, width)
+                lines.append(tag_line)
+
+        return lines
+
+    def _build_medium_content(
+        self, start_dt: datetime, end_dt: datetime,
+        duration: str, description: str, tags: list[str],
+        width: int, height_cat: str, content_rows: int,
+    ) -> list[str]:
+        """Build content for MEDIUM width (7-13 chars)"""
+        lines = []
+
+        if height_cat == 'tiny':
+            # Project + duration already combined in first line
+            pass
+
+        elif height_cat == 'short':
+            # Row 2: Time (abbreviated)
+            # Row 3: Duration
+            time_abbr = self._format_time_abbreviated(start_dt, end_dt, width)
+            lines.append(time_abbr)
+            if content_rows >= 3:
+                lines.append(duration)
+
+        elif height_cat == 'medium':
+            # Row 2: Time
+            # Row 3: Duration
+            # Row 4: Description (truncated)
+            # Row 5: Tags (first tag only)
+            time_abbr = self._format_time_abbreviated(start_dt, end_dt, width)
+            lines.append(time_abbr)
+            lines.append(duration)
+
+            if content_rows >= 4 and description:
+                desc_line = self._truncate_smart(description, width, "..")
+                lines.append(desc_line)
+
+            if content_rows >= 5 and tags and tags[0] != NO_TAG_LABEL:
+                tag_line = self._format_tags_for_box(tags, width)
+                lines.append(tag_line)
+
+        else:  # tall or very_tall
+            # Row 2: Time
+            # Row 3: Duration
+            # Row 4: Description (truncated)
+            # Last row: Tags
+            time_abbr = self._format_time_abbreviated(start_dt, end_dt, width)
+            lines.append(time_abbr)
+            lines.append(duration)
+
+            has_tags = tags and tags[0] != NO_TAG_LABEL
+            rows_for_desc = content_rows - 3  # After project, time, duration
+            if has_tags:
+                rows_for_desc -= 1  # Reserve last row for tags
+
+            if rows_for_desc > 0 and description:
+                desc_line = self._truncate_smart(description, width, "..")
+                lines.append(desc_line)
+
+            if has_tags:
+                while len(lines) < content_rows - 1:
+                    lines.append("")
+                tag_line = self._format_tags_for_box(tags, width)
+                lines.append(tag_line)
+
+        return lines
+
+    def _build_narrow_content(
+        self, start_dt: datetime, end_dt: datetime,
+        duration: str, description: str, tags: list[str],
+        width: int, height_cat: str, content_rows: int
+    ) -> list[str]:
+        """Build content for NARROW width (3-6 chars)"""
+        lines = []
+
+        if height_cat == 'tiny':
+            # Only project (abbrev) in first line
+            pass
+
+        elif height_cat == 'short':
+            # Row 2: Duration
+            lines.append(duration)
+
+        else:  # medium, tall, very_tall
+            # Row 2: Duration
+            # Row 3: Time (hour only)
+            # Row 4: Description indicator icon
+            # Row 5: Tags indicator icon
+            lines.append(duration)
+
+            if content_rows >= 3:
+                time_abbr = self._format_time_abbreviated(start_dt, end_dt, width)
+                lines.append(time_abbr)
+
+            if content_rows >= 4 and description:
+                lines.append(self._has_description_icon())
+
+            if content_rows >= 5 and tags and tags[0] != NO_TAG_LABEL:
+                lines.append(self._has_tags_icon(tags))
+
+        return lines
+
+    def _render_daily_compact(self, data: AggregatedData, spec: CommandSpec) -> str:
+        """Vertical timeline format"""
+        lines = []
+
+        # Group segments by day
+        by_day = defaultdict(list)
+        for seg in data.segments:
+            day_key = datetime.fromtimestamp(seg.start_epoch).date()
+            by_day[day_key].append(seg)
+
+        # Sort days chronologically
+        sorted_days = sorted(by_day.keys())
+
+        if not sorted_days:
+            return "No time segments to display\n"
+
+        # Build header
+        if len(sorted_days) == 1:
+            day_dt = datetime.combine(sorted_days[0], datetime.min.time())
+            header = f"DAILY CALENDAR: {self.date_fmt.format_day(day_dt.weekday(), full=True)}, {MONTH_NAMES_SHORT[day_dt.month - 1]} {day_dt.day} ({day_dt.year})"
+        else:
+            first_dt = datetime.combine(sorted_days[0], datetime.min.time())
+            last_dt = datetime.combine(sorted_days[-1], datetime.min.time())
+
+            # Check if within same week
+            first_iso = first_dt.isocalendar()
+            last_iso = last_dt.isocalendar()
+
+            if first_iso.year == last_iso.year and first_iso.week == last_iso.week:
+                header = f"DAILY CALENDAR: {MONTH_NAMES_SHORT[first_dt.month - 1]} {first_dt.day} - {MONTH_NAMES_SHORT[last_dt.month - 1]} {last_dt.day} (Week {first_iso.week}, {first_dt.year})"
+            else:
+                header = f"DAILY CALENDAR: {MONTH_NAMES_SHORT[first_dt.month - 1]} {first_dt.day} ({first_dt.year}) - {MONTH_NAMES_SHORT[last_dt.month - 1]} {last_dt.day} ({last_dt.year})"
+
+        lines.append(header)
+        lines.append(self.border.draw_header_separator(len(header)))
+        lines.append("")
+
+        # Total duration for period
+        total_duration = sum(seg.duration_sec for seg in data.segments)
+
+        # Render each day
+        current_week = None
+        week_duration = 0
+        for day_date in sorted_days:
+            day_segs = sorted(by_day[day_date], key=lambda s: s.start_epoch)
+            day_dt = datetime.combine(day_date, datetime.min.time())
+            iso_week = day_dt.isocalendar()[:2]
+
+            # Week separator
+            if current_week is not None and iso_week != current_week:
+                week_total_str = f"Week Total: {self.duration_fmt.format(week_duration)}"
+                lines.append(f"{week_total_str:>{COMPACT_FORMAT_WIDTH}}")
+                lines.append("")
+                lines.append("")
+                week_duration = 0
+            current_week = iso_week
+
+            # Day total
+            day_total = sum(seg.duration_sec for seg in day_segs)
+            week_duration += day_total
+            day_header = f"{self.date_fmt.format_day(day_dt.weekday(), full=True)}, {MONTH_NAMES_SHORT[day_dt.month - 1]} {day_dt.day}"
+            day_total_str = self.duration_fmt.format(day_total)
+
+            # Right-align total
+            padding = COMPACT_FORMAT_WIDTH - len(day_header) - len(day_total_str)
+            lines.append(f"{day_header}{' ' * padding}{day_total_str}")
+            lines.append(self.border.draw_separator(COMPACT_FORMAT_WIDTH))
+
+            if not day_segs:
+                lines.append("(no time tracked)")
+            else:
+                # Detect overlaps
+                overlaps = self._detect_day_overlaps(day_segs)
+
+                for i, seg in enumerate(day_segs):
+                    # Format time
+                    start_dt = datetime.fromtimestamp(seg.start_epoch)
+                    end_dt = datetime.fromtimestamp(seg.end_epoch)
+                    time_start = start_dt.strftime("%H:%M")
+                    time_range = f"{start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}"
+                    duration = self.duration_fmt.format(seg.duration_sec)
+
+                    # Project name
+                    label = seg.project or NO_PROJECT_LABEL
+
+                    # Check if this segment overlaps with next
+                    is_overlap = i in overlaps
+                    is_last_in_overlap = i in overlaps and (i + 1) not in overlaps
+
+                    if is_overlap:
+                        prefix = "└─" if is_last_in_overlap else "├─"
+                        overlap_warn = "  ⚠ overlap"
+                    else:
+                        prefix = "  "
+                        overlap_warn = ""
+
+                    # Format primary line with project
+                    line = f"{time_start}  {prefix}{label:<22}  {time_range}  {duration}{overlap_warn}"
+                    lines.append(line)
+
+                    # Add description line (indented)
+                    desc = self._truncate_description(seg.description, max_len=50)
+                    if desc:
+                        indent_prefix = "       " + ("│ " if is_overlap and not is_last_in_overlap else "  ")
+                        lines.append(f"{indent_prefix}\"{desc}\"")
+
+                    # Add tags line (indented)
+                    tags_str = self._format_tags_compact(seg.tags, max_width=60)
+                    if tags_str:
+                        indent_prefix = "       " + ("│ " if is_overlap and not is_last_in_overlap else "  ")
+                        lines.append(f"{indent_prefix}{tags_str}")
+
+            lines.append("")
+
+        # Last week total
+        if week_duration > 0 and len(sorted_days) > 1:
+            week_total_str = f"Week Total: {self.duration_fmt.format(week_duration)}"
+            lines.append(f"{week_total_str:>{COMPACT_FORMAT_WIDTH}}")
+            lines.append("")
+
+        # Footer
+        lines.append(self.border.draw_header_separator(COMPACT_FORMAT_WIDTH))
+        if len(sorted_days) == 1:
+            footer = f"Total: {self.duration_fmt.format(total_duration)}"
+        else:
+            footer = f"Period Total: {self.duration_fmt.format(total_duration)}"
+        lines.append(footer)
+        lines.append("")
+
+        return '\n'.join(lines)
+
+    def _detect_day_overlaps(self, segments: list[Segment]) -> set[int]:
+        """Detect which segment indices overlap with their next segment"""
+        overlaps = set()
+        for i in range(len(segments) - 1):
+            if segments[i].end_epoch > segments[i + 1].start_epoch:
+                overlaps.add(i)
+                overlaps.add(i + 1)
+        return overlaps
+
+    def _format_tags_compact(self, tags: list[str], max_width: int = 60) -> str:
+        """Format tags compactly with brackets, truncating if needed"""
+        if not tags or tags[0] == NO_TAG_LABEL:
+            return ""
+
+        # Format as [tag1, tag2, tag3]
+        tags_str = "[" + ", ".join(tags) + "]"
+
+        if len(tags_str) > max_width:
+            # Truncate and add ellipsis
+            tags_str = tags_str[:max_width-3] + "...]"
+
+        return tags_str
+
+    def _truncate_description(self, desc: str, max_len: int = 50) -> str:
+        """Truncate description intelligently at word boundaries"""
+        if not desc:
+            return ""
+
+        if len(desc) <= max_len:
+            return desc
+
+        # Truncate at word boundary
+        truncated = desc[:max_len].rsplit(' ', 1)[0]
+        return truncated + "..."
+
+
+# ============================================================================
+# SECTION 7: CLI ORCHESTRATION
+# ============================================================================
+
+def execute_pipeline(spec: CommandSpec) -> str:
+    """Execute complete reporting pipeline"""
+
+    # Stage 1: Load data
+    blocks = load_zeit_data()
+
+    # Stage 2-3: Extract and preprocess
+    raw_segments = extract_segments(blocks)
+    segments = preprocess_segments(raw_segments)
+
+    # Stage 4: Period filtering
+    if spec.period_expr:
+        segments = apply_period_filter(segments, spec.period_expr)
+
+    # Check if we have any data
+    if not segments:
+        return "No time segments found for the specified period.\n"
+
+    # Stage 5: Tag expansion if needed
+    if "tag" in [d.name for d in spec.dimensions]:
+        segments = expand_tags(segments)
+
+    # Stage 6: Aggregation
+    data = aggregate_by_dimensions(
+        segments,
+        [d.name for d in spec.dimensions],
+    )
+
+    # Stage 7: Rendering
+    renderer = Renderer()
+    output = renderer.render(data, spec)
+
+    return output
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    """Build argument parser"""
+    parser = argparse.ArgumentParser(
+        description="Zeit time tracking visualizer",
+        epilog="Examples:\n"
+               "  zeit export -f json | timereport project\n"
+               "  zeit export -f json | timereport dailycal --period week\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument(
+        'dimensions',
+        nargs='*',
+        help='Dimension to report on (project, tag, day, week, month, year) '
+             'or command (dailycal)'
+    )
+
+    parser.add_argument(
+        '--period',
+        help='Period filter (today, yesterday, week, lastweek, month, lastmonth, '
+             'year, lastyear, Ndays, Nweeks, Nmonths, Nyears)'
+    )
+
+    parser.add_argument(
+        '--compact',
+        action='store_true',
+        help='Use compact format for dailycal'
+    )
+
+    parser.add_argument(
+        '--sparse',
+        action='store_true',
+        help='Use sparse format for dailycal (fixed-height boxes with gaps)'
+    )
+
+    return parser
+
+
+# ============================================================================
+# SECTION 8: MAIN ENTRY POINT
+# ============================================================================
+
+def main(argv: list[str] | None = None) -> int:
+    """Main entry point"""
+    parser = build_argument_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        # Build command specification
+        spec = build_command_spec(args)
+
+        # Execute pipeline
+        output = execute_pipeline(spec)
+
+        # Print to stdout
+        print(output, end='')
+
+        return 0
+
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"Unexpected error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
