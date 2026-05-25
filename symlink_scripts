@@ -5,4 +5,4 @@
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 # Create a symlink to the scripts folder in $HOME
-ln -s "$DIR" "$HOME/Scripts"
+ln -s "$DIR" "$HOME/scripts"
