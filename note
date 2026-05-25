@@ -1,72 +1,120 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# note - notes navigation and scaffolding
+#
+# Standalone script; symlink into $PATH (see symlink_scripts). Owns
+# cross-notebook ops only — inside a notebook, use vim + wikijump.vim
+# plugin.
+# No command mutates the parent shell; compose with cd $(note where).
 
 show_help() {
-    cat << 'EOF'
-note - Quick access to notes directory ($NOTES)
+    cat <<'EOF'
+note - notes navigation and scaffolding
 
 USAGE
     note <command> [args]
 
 COMMANDS
-    journal [last]  Open today's journal, or last entry with 'last'
-    journals        Browse journals with fzf preview
-    index           Open main index ($NOTES/index.md)
-    page [path]     Open/create page
-                      - No arg: fzf select directory, then prompt for page name
-                      - With arg: open $NOTES/<path>.md directly
-    search [-i]     Fuzzy find markdown files
-                      - -i: show file preview in fzf
-    rg <pattern>    Ripgrep search across all notes
+    find            fzf any .md under $NOTE_HOME, open in vim
+    where           fzf a notebook root, print its path
+    new <t> <path>  scaffold notebook from $NOTE_HOME/_templates/<t>
+                      at $NOTE_HOME/<path>
+    home            print $NOTE_HOME
+    completion      print bash completion script to stdout
+    help            show this message
 
-EXAMPLES
-    note journal              # Today's journal entry
-    note page projects/todo   # Open $NOTES/projects/todo.md
-    note search -i            # Browse files with preview
-    note rg "TODO"            # Find all TODOs
+COMPOSE
+    cd $(note where)            jump to a notebook
+    vim $(note home)            netrw on notes root
+
+Use z (or any directory jumper) for frequently-visited notebooks.
+Inside a notebook, use vim + wikijump.
+
+ENVIRONMENT
+    NOTE_HOME       notes root (default: ~/notes)
+
+TEMPLATES
+    $NOTE_HOME/_templates/<name>/     directory templates for `note new`
+
+INSTALL COMPLETION
+    bash:   note completion > ~/.local/share/bash-completion/completions/note
+    zsh:    autoload -U +X bashcompinit && bashcompinit
+            note completion > "${fpath[1]}/_note"
+    eval:   eval "$(note completion)"
 EOF
 }
 
-case "$1" in
-    help)
+main() {
+    local home="${NOTE_HOME:-$HOME/notes}"
+
+    case "$1" in
+    ""|help|-h|--help)
         show_help
-        exit 0
         ;;
-    journal)
-        if [ "$2" = "last" ]; then
-            file=$(find "$NOTES/journal" -type f -name "*.md" | sort -r | head -1)
-            [ -n "$file" ] && vim "$file"
-        else
-            vim "$NOTES/journal/$(date +%Y-%m-%d).md"
+
+    find)
+        local f
+        f=$(rg --files --type md --glob '!_*' "$home" | fzf) \
+            && [ -n "$f" ] && vim "$f"
+        ;;
+
+    where)
+        find "$home" -name .wikijump \
+            -not -path '*/_*' -not -path '*/.*/*' -printf '%h\n' | fzf
+        ;;
+
+    new)
+        if [ -z "$2" ] || [ -z "$3" ]; then
+            echo "usage: note new <template> <path>" >&2
+            exit 1
         fi
+        local src="$home/_templates/$2"
+        local dst="$home/$3"
+        [ -d "$src" ] || { echo "no template: $2" >&2; exit 1; }
+        [ ! -e "$dst" ] || { echo "exists: $dst" >&2; exit 1; }
+        cp -r "$src" "$dst" || exit 1
+        # Landing page name follows wikijump: first non-blank line of
+        # the marker, else index.md.
+        local index
+        index=$(awk 'NF{gsub(/^[ \t]+|[ \t]+$/,"");print;exit}' \
+                "$dst/.wikijump" 2>/dev/null)
+        vim "$dst/${index:-index.md}"
         ;;
-    index)
-        vim "$NOTES/index.md" 
+
+    home)
+        echo "$home"
         ;;
-    page)
-        if [ -z "$2" ]; then
-            dir=$(find "$NOTES" -maxdepth 1 -mindepth 1 -type d -not -path '*/[_.]*' | fzf) && [ -n "$dir" ] || exit 0
-            read -rp "Open page (or create new): " page
-            [ -n "$page" ] && vim "$dir/$page.md"
-        else
-            vim "$NOTES/$2.md"
-        fi
+
+    completion)
+        cat <<'EOF'
+_note() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local home="${NOTE_HOME:-$HOME/notes}"
+
+    case "$COMP_CWORD" in
+        1)
+            COMPREPLY=($(compgen -W "find where new home help completion" -- "$cur"))
+            ;;
+        2)
+            [ "${COMP_WORDS[1]}" = new ] \
+                && COMPREPLY=($(cd "$home/_templates" 2>/dev/null && compgen -d -- "$cur"))
+            ;;
+        3)
+            [ "${COMP_WORDS[1]}" = new ] \
+                && COMPREPLY=($(cd "$home" 2>/dev/null && compgen -d -- "$cur"))
+            ;;
+    esac
+}
+complete -F _note note
+EOF
         ;;
-    journals)
-        file=$(find "$NOTES/journal" -type f -name "*.md" | sort -r | fzf --preview 'cat {}') && [ -n "$file" ] && vim "$file"
-        ;;
-    search)
-        if [ "$2" = "-i" ]; then
-            file=$(find "$NOTES" -type f -name "*.md" | fzf --preview 'cat {}') && [ -n "$file" ] && vim "$file"
-        else
-            file=$(find "$NOTES" -type f -name "*.md" | fzf) && [ -n "$file" ] && vim "$file"
-        fi
-        ;;
-    rg)
-        rg "$2" "$NOTES"
-        ;;
+
     *)
+        echo "unknown command: $1" >&2
         show_help
         exit 1
         ;;
-esac
+    esac
+}
 
+main "$@"
