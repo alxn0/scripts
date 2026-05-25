@@ -74,11 +74,11 @@ main() {
         [ ! -e "$dst" ] || { echo "exists: $dst" >&2; exit 1; }
         cp -r "$src" "$dst" || exit 1
         # Landing page name follows wikijump: first non-blank line of
-        # the marker, else index.md.
+        # the marker, else README.md.
         local index
         index=$(awk 'NF{gsub(/^[ \t]+|[ \t]+$/,"");print;exit}' \
                 "$dst/.wikijump" 2>/dev/null)
-        vim "$dst/${index:-index.md}"
+        vim "$dst/${index:-README.md}"
         ;;
 
     home)
