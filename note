@@ -7,6 +7,11 @@
 # plugin.
 # No command mutates the parent shell; compose with cd $(note where).
 
+# Filesystem conventions shared with the wikijump.vim plugin.
+readonly NOTEBOOK_MARKER=".wikijump"  # marks a directory as a notebook
+readonly DEFAULT_INDEX="README.md"    # landing page when marker is empty
+readonly TEMPLATES_DIR="_templates"   # template store under $NOTE_HOME
+
 show_help() {
     cat <<'EOF'
 note - notes navigation and scaffolding
@@ -59,7 +64,7 @@ main() {
         ;;
 
     where)
-        find "$home" -name .wikijump \
+        find "$home" -name "$NOTEBOOK_MARKER" \
             -not -path '*/_*' -not -path '*/.*/*' -printf '%h\n' | fzf
         ;;
 
@@ -68,7 +73,7 @@ main() {
             echo "usage: note new <template> <path>" >&2
             exit 1
         fi
-        local src="$home/_templates/$2"
+        local src="$home/$TEMPLATES_DIR/$2"
         local dst="$3"
         [ -d "$src" ] || { echo "no template: $2" >&2; exit 1; }
         [ ! -e "$dst" ] || { echo "exists: $dst" >&2; exit 1; }
@@ -77,8 +82,8 @@ main() {
         # the marker, else README.md.
         local index
         index=$(awk 'NF{gsub(/^[ \t]+|[ \t]+$/,"");print;exit}' \
-                "$dst/.wikijump" 2>/dev/null)
-        vim "$dst/${index:-README.md}"
+                "$dst/$NOTEBOOK_MARKER" 2>/dev/null)
+        vim "$dst/${index:-$DEFAULT_INDEX}"
         ;;
 
     home)
