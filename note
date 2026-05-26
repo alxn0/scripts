@@ -18,7 +18,7 @@ COMMANDS
     find            fzf any .md under $NOTE_HOME, open in vim
     where           fzf a notebook root, print its path
     new <t> <path>  scaffold notebook from $NOTE_HOME/_templates/<t>
-                      at $NOTE_HOME/<path>
+                      at <path> (relative to current directory)
     home            print $NOTE_HOME
     completion      print bash completion script to stdout
     help            show this message
@@ -69,7 +69,7 @@ main() {
             exit 1
         fi
         local src="$home/_templates/$2"
-        local dst="$home/$3"
+        local dst="$3"
         [ -d "$src" ] || { echo "no template: $2" >&2; exit 1; }
         [ ! -e "$dst" ] || { echo "exists: $dst" >&2; exit 1; }
         cp -r "$src" "$dst" || exit 1
@@ -101,7 +101,7 @@ _note() {
             ;;
         3)
             [ "${COMP_WORDS[1]}" = new ] \
-                && COMPREPLY=($(cd "$home" 2>/dev/null && compgen -d -- "$cur"))
+                && COMPREPLY=($(compgen -d -- "$cur"))
             ;;
     esac
 }
