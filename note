@@ -86,7 +86,7 @@ main() {
         else
             root="$home"
         fi
-        local fzf_args=(-1 -0)
+        local fzf_args=(-e -1 -0)
         [ -n "$query" ] && fzf_args+=(-q "$query")
         local f
         f=$(rg --files --type md --glob '!_*' "$root" \
@@ -95,7 +95,7 @@ main() {
         ;;
 
     where)
-        local fzf_args=(-1 -0)
+        local fzf_args=(-e -1 -0)
         [ -n "$2" ] && fzf_args+=(-q "$2")
         local sel
         sel=$(find "$home" -name "$NOTEBOOK_MARKER" \
