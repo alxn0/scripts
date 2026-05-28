@@ -1,45 +1,50 @@
 #!/usr/bin/env bash
 #
-# note - notes navigation and scaffolding
+# note - notebook manager
 #
 # Standalone script; symlink into $PATH (see symlink_scripts). Owns
 # cross-notebook ops only — inside a notebook, use vim + wikijump.vim
-# plugin.
+# plugin. All commands operate relative to $NOTE_HOME.
 # No command mutates the parent shell; compose with cd $(note where).
 
 # Filesystem conventions shared with the wikijump.vim plugin.
 readonly NOTEBOOK_MARKER=".wikijump"  # marks a directory as a notebook
-readonly DEFAULT_INDEX="README.md"    # landing page when marker is empty
-readonly TEMPLATES_DIR="_templates"   # template store under $NOTE_HOME
+readonly DEFAULT_INDEX="README.md"    # landing page for a new notebook
 
 show_help() {
     cat <<'EOF'
-note - notes navigation and scaffolding
+note - notebook manager
 
 USAGE
     note <command> [args]
 
 COMMANDS
-    find            fzf any .md under $NOTE_HOME, open in vim
-    where           fzf a notebook root, print its path
-    new <t> <path>  scaffold notebook from $NOTE_HOME/_templates/<t>
-                      at <path> (relative to current directory)
-    home            print $NOTE_HOME
-    completion      print bash completion script to stdout
-    help            show this message
+    find [-n|--notebook <nb>] [<query>]
+                           fzf .md files under $NOTE_HOME, open in vim
+                             optionally restricted to notebook <nb>
+                             <query> pre-fills fzf; auto-opens on a
+                             single match
+    where [<nb>]           fzf a notebook root, print its absolute path
+                             with <nb> as a fuzzy filter; auto-pick on
+                             a single match
+    new <name>             create $NOTE_HOME/<name>/ with a .wikijump
+                             marker, open the landing page
+    home                   print $NOTE_HOME
+    completion             print bash completion script to stdout
+    help                   show this message
 
 COMPOSE
-    cd $(note where)            jump to a notebook
     vim $(note home)            netrw on notes root
+
+    Shell helper (drop in your rc) to jump into a notebook:
+        nb() { cd "$(note where "$@")"; }
+    Then: nb [<nb>] — picker, skipped when <nb> narrows to one match.
 
 Use z (or any directory jumper) for frequently-visited notebooks.
 Inside a notebook, use vim + wikijump.
 
 ENVIRONMENT
     NOTE_HOME       notes root (default: ~/notes)
-
-TEMPLATES
-    $NOTE_HOME/_templates/<name>/     directory templates for `note new`
 
 INSTALL COMPLETION
     bash:   note completion > ~/.local/share/bash-completion/completions/note
@@ -58,32 +63,54 @@ main() {
         ;;
 
     find)
+        shift
+        local notebook=""
+        local query=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                -n|--notebook)
+                    [ -n "$2" ] || { echo "missing notebook name" >&2; exit 1; }
+                    notebook="$2"; shift 2 ;;
+                -*) echo "unknown flag: $1" >&2; exit 1 ;;
+                *)
+                    [ -z "$query" ] || { echo "unexpected arg: $1" >&2; exit 1; }
+                    query="$1"; shift ;;
+            esac
+        done
+        local root
+        if [ -n "$notebook" ]; then
+            root="$home/$notebook"
+            [ -d "$root" ] || { echo "no notebook: $notebook" >&2; exit 1; }
+        elif [ -f "$PWD/$NOTEBOOK_MARKER" ]; then
+            root="$PWD"
+        else
+            root="$home"
+        fi
+        local fzf_args=(-1 -0)
+        [ -n "$query" ] && fzf_args+=(-q "$query")
         local f
-        f=$(rg --files --type md --glob '!_*' "$home" | fzf) \
-            && [ -n "$f" ] && vim "$f"
+        f=$(rg --files --type md --glob '!_*' "$root" \
+            | sed "s|^$root/||" | fzf "${fzf_args[@]}") \
+            && [ -n "$f" ] && vim "$root/$f"
         ;;
 
     where)
-        find "$home" -name "$NOTEBOOK_MARKER" \
-            -not -path '*/_*' -not -path '*/.*/*' -printf '%h\n' | fzf
+        local fzf_args=(-1 -0)
+        [ -n "$2" ] && fzf_args+=(-q "$2")
+        local sel
+        sel=$(find "$home" -name "$NOTEBOOK_MARKER" \
+            -not -path '*/_*' -not -path '*/.*/*' -printf '%h\n' \
+            | sed "s|^$home/||" | fzf "${fzf_args[@]}") \
+            && [ -n "$sel" ] && echo "$home/$sel"
         ;;
 
     new)
-        if [ -z "$2" ] || [ -z "$3" ]; then
-            echo "usage: note new <template> <path>" >&2
-            exit 1
-        fi
-        local src="$home/$TEMPLATES_DIR/$2"
-        local dst="$3"
-        [ -d "$src" ] || { echo "no template: $2" >&2; exit 1; }
+        [ -n "$2" ] || { echo "usage: note new <name>" >&2; exit 1; }
+        local dst="$home/$2"
         [ ! -e "$dst" ] || { echo "exists: $dst" >&2; exit 1; }
-        cp -r "$src" "$dst" || exit 1
-        # Landing page name follows wikijump: first non-blank line of
-        # the marker, else README.md.
-        local index
-        index=$(awk 'NF{gsub(/^[ \t]+|[ \t]+$/,"");print;exit}' \
-                "$dst/$NOTEBOOK_MARKER" 2>/dev/null)
-        vim "$dst/${index:-$DEFAULT_INDEX}"
+        mkdir -p "$dst" || exit 1
+        : > "$dst/$NOTEBOOK_MARKER" || exit 1
+        vim "$dst/$DEFAULT_INDEX"
         ;;
 
     home)
@@ -94,19 +121,27 @@ main() {
         cat <<'EOF'
 _note() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
+    local prev="${COMP_WORDS[COMP_CWORD-1]}"
     local home="${NOTE_HOME:-$HOME/notes}"
 
-    case "$COMP_CWORD" in
-        1)
-            COMPREPLY=($(compgen -W "find where new home help completion" -- "$cur"))
+    if [ "$COMP_CWORD" = 1 ]; then
+        COMPREPLY=($(compgen -W "find where new home help completion" -- "$cur"))
+        return
+    fi
+    case "${COMP_WORDS[1]}" in
+        find)
+            case "$prev" in
+                -n|--notebook)
+                    COMPREPLY=($(cd "$home" 2>/dev/null && compgen -d -- "$cur"))
+                    ;;
+                find)
+                    COMPREPLY=($(compgen -W "-n --notebook" -- "$cur"))
+                    ;;
+            esac
             ;;
-        2)
-            [ "${COMP_WORDS[1]}" = new ] \
-                && COMPREPLY=($(cd "$home/_templates" 2>/dev/null && compgen -d -- "$cur"))
-            ;;
-        3)
-            [ "${COMP_WORDS[1]}" = new ] \
-                && COMPREPLY=($(compgen -d -- "$cur"))
+        where)
+            [ "$COMP_CWORD" = 2 ] \
+                && COMPREPLY=($(cd "$home" 2>/dev/null && compgen -d -- "$cur"))
             ;;
     esac
 }
