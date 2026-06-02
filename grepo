@@ -1,0 +1,39 @@
+#!/bin/bash
+# Run a git command in every git repo found within a depth range.
+# Usage: grepo [-m MIN] [-M MAX] <git args...>
+#   grepo status -sb        # like the old gstatus, direct children
+#   grepo fetch             # like the old gfetch
+#   grepo -M 2 fetch        # also descend one level for nested repos
+#   grepo -m 2 -M 2 status  # only repos exactly two levels deep
+# Only directories containing .git are run; their subfolders are skipped (pruned).
+
+usage() { sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; }
+
+min=1
+max=1
+while getopts "m:M:h" opt; do
+  case "$opt" in
+    m) min=$OPTARG ;;
+    M) max=$OPTARG ;;
+    h) usage; exit 0 ;;
+    *) usage; exit 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+if [ "$#" -eq 0 ]; then
+  echo "grepo: no git command given" >&2
+  usage >&2
+  exit 1
+fi
+
+# shellcheck disable=SC2016  # the inner sh expands $d/$@/$?, not the outer shell
+exec find . -mindepth "$min" -maxdepth "$max" -type d \
+  -exec test -e '{}/.git' \; -prune \
+  -exec sh -c '
+    d=$1; shift
+    echo "$d"
+    cd "$d" 2>/dev/null || { echo "grepo: cannot enter $d, skipping" >&2; exit 0; }
+    git "$@" || echo "grepo: git ${1:-} failed in $d (exit $?), continuing" >&2
+    echo
+  ' sh '{}' "$@" \;
