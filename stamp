@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# stamp — prepend 'created: <today>' YAML frontmatter to a note.
+# stdin → stdout filter, idempotent: input already starting with '---' passes through.
+#
+# vim: :%!stamp
+set -e
+
+(( $# == 0 )) || { echo "stamp: takes no arguments" >&2; exit 1; }
+
+note=$(cat)
+case $note in
+  '---'*) printf '%s\n' "$note" ;;
+  *) printf '%s\n' '---' "created: $(date +%F)" '---' '' "$note" ;;
+esac

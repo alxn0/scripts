@@ -1,6 +1,3 @@
 #!/usr/bin/env bash
-#
-# zet - zettlekasten utility
-#
-# Wrapper around note. Quickly create and find zettlekasten.
-note -c -n "zet" "$@"
+# Wrapper around note. Quickly find inbox.
+note -c -n "inbox" "$@"
