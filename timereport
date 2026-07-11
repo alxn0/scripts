@@ -701,9 +701,12 @@ class Renderer:
         # Sort temporal values chronologically
         sorted_temp = sorted(temp_totals, key=lambda v: self._temporal_sort_key(temp_dim, v))
 
-        # Sort categorical values by total descending
+        # Sort categorical values: task alphabetically, others by total descending
         cat_totals = {cat: sum(vals.values()) for cat, vals in crosstab.items()}
-        sorted_cat = sorted(cat_totals, key=lambda c: cat_totals[c], reverse=True)
+        if cat_dim == "task":
+            sorted_cat = sorted(cat_totals)
+        else:
+            sorted_cat = sorted(cat_totals, key=lambda c: cat_totals[c], reverse=True)
 
         # Auto-transpose: if too many temporal values, swap axes
         if len(sorted_temp) > CROSSTAB_TRANSPOSE_THRESHOLD:
