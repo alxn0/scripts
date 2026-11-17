@@ -1,0 +1,151 @@
+#!/bin/bash
+# Upgrade every package manager on this Ubuntu machine.
+# Upgrades: apt, snap, flatpak, mise, Go binaries, rustup, cargo crates, uv tools,
+#   npm globals, gh extensions, Claude Code. Clears the npx cache so npx fetches latest.
+# Reports only: firmware, new Ubuntu release, Go toolchain, Node, pending reboot.
+# A manager whose command is missing is skipped. A failing step is reported, the
+# others still run, and the script exits 1 if any step failed.
+
+if [ "$#" -ne 0 ]; then
+  sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//' >&2
+  exit 1
+fi
+
+failed_steps=()
+
+# Print a bold section header
+print_section() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
+
+# Run a step when its command exists; record its name if it fails.
+# Usage: run_step <name> <required command> <function>
+run_step() {
+  local name=$1 required_command=$2 step_function=$3
+  if ! command -v "$required_command" >/dev/null; then
+    print_section "$name: skipped, $required_command not found"
+    return
+  fi
+  print_section "$name"
+  if ! "$step_function"; then
+    echo "$name failed" >&2
+    failed_steps+=("$name")
+  fi
+}
+
+# Print the current and latest version when they differ.
+# Usage: report_version <name> <current> <latest>
+report_version() {
+  local name=$1 current=$2 latest=$3
+  if [ -z "$latest" ]; then
+    echo "could not fetch latest $name version" >&2
+    return 1
+  fi
+  if [ "$current" = "$latest" ]; then
+    echo "$name $current is the latest"
+  else
+    echo "$name $current installed, $latest available"
+  fi
+}
+
+upgrade_apt() {
+  sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove --purge -y
+}
+
+upgrade_snap() { sudo snap refresh; }
+
+upgrade_flatpak() { flatpak update -y && flatpak uninstall --unused -y; }
+
+upgrade_mise() { mise self-update -y && mise upgrade; }
+
+# Go has no upgrade command: reinstall each binary from the package path embedded in it
+upgrade_go_binaries() {
+  local bin_dir binary package_path status=0
+  bin_dir=$(go env GOBIN)
+  [ -n "$bin_dir" ] || bin_dir="$(go env GOPATH)/bin"
+  for binary in "$bin_dir"/*; do
+    [ -x "$binary" ] || continue
+    package_path=$(go version -m "$binary" | awk '$1 == "path" { print $2; exit }')
+    if [ -z "$package_path" ]; then
+      echo "$binary: no package path embedded, skipping" >&2
+      status=1
+      continue
+    fi
+    echo "$package_path"
+    go install "$package_path@latest" || status=1
+  done
+  return "$status"
+}
+
+upgrade_rustup() { rustup update; }
+
+# `cargo install` skips a crate already at its latest version; git and path installs are left alone
+upgrade_cargo_crates() {
+  local crate status=0
+  for crate in $(cargo install --list | awk '/^[^ ]+ v[^ ]+:$/ { print $1 }'); do
+    cargo install "$crate" || status=1
+  done
+  return "$status"
+}
+
+upgrade_uv_tools() { uv self update && uv tool upgrade --all; }
+
+upgrade_npm_globals() { npm update -g; }
+
+# npx reuses a cached package forever instead of checking for a newer version
+clear_npx_cache() {
+  local cache_dir
+  cache_dir=$(npm config get cache) || return 1
+  rm -rf -- "${cache_dir:?}/_npx"
+}
+
+upgrade_gh_extensions() { gh extension upgrade --all; }
+
+upgrade_claude() { claude update; }
+
+# fwupdmgr exits 2 when there is nothing to do
+check_firmware() {
+  fwupdmgr refresh
+  [ "$?" -le 2 ] || return 1
+  fwupdmgr get-updates
+  [ "$?" -le 2 ]
+}
+
+# do-release-upgrade -c exits 1 when no new release is available
+check_ubuntu_release() { do-release-upgrade -c || true; }
+
+check_go_toolchain() {
+  report_version Go "$(go env GOVERSION)" "$(curl -fsS 'https://go.dev/VERSION?m=text' | head -n 1)"
+}
+
+check_node() {
+  report_version Node "$(node --version)" "$(curl -fsS https://nodejs.org/dist/index.json | jq -r 'map(select(.version | contains("-") | not))[0].version')"
+}
+
+sudo -v || exit 1
+
+run_step apt apt upgrade_apt
+run_step snap snap upgrade_snap
+run_step flatpak flatpak upgrade_flatpak
+run_step mise mise upgrade_mise
+run_step "Go binaries" go upgrade_go_binaries
+run_step rustup rustup upgrade_rustup
+run_step "cargo crates" cargo upgrade_cargo_crates
+run_step "uv tools" uv upgrade_uv_tools
+run_step "npm globals" npm upgrade_npm_globals
+run_step "npx cache" npm clear_npx_cache
+run_step "gh extensions" gh upgrade_gh_extensions
+run_step "Claude Code" claude upgrade_claude
+run_step "firmware (check only)" fwupdmgr check_firmware
+run_step "Ubuntu release (check only)" do-release-upgrade check_ubuntu_release
+run_step "Go toolchain (check only)" go check_go_toolchain
+run_step "Node (check only)" node check_node
+
+print_section "Summary"
+if [ -f /var/run/reboot-required ]; then
+  echo "Reboot required by:"
+  cat /var/run/reboot-required.pkgs 2>/dev/null
+fi
+if [ "${#failed_steps[@]}" -ne 0 ]; then
+  printf 'Failed: %s\n' "${failed_steps[@]}" >&2
+  exit 1
+fi
+echo "All steps succeeded"
