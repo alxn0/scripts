@@ -4,6 +4,7 @@
 # Get the folder path in which this script is located
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-# Create a symlink to the scripts folder in $HOME
-ln -s "$DIR" "$HOME/scripts"
+# Link the scripts folder as $HOME/scripts; -n replaces an existing link
+# instead of nesting a new one inside it, so re-runs are safe
+ln -sfn "$DIR" "$HOME/scripts"
 ls -l "$HOME/scripts"
